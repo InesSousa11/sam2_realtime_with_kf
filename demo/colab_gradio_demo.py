@@ -41,52 +41,6 @@ DEFAULT_NUM_OBJECTS = 10
 DEFAULT_YOLO_MODEL = "yolov8n.pt"
 DEFAULT_YOLO_CONF = 0.25
 
-# Try these CFG paths in order (they vary across forks).
-CFG_CANDIDATES = {
-    "tiny": [
-        "configs/sam2.1_hiera_t.yaml",
-        "configs/sam2.1_hiera_tiny.yaml",
-        "configs/samurai/sam2.1_hiera_t.yaml",
-        "configs/samurai/sam2.1_hiera_tiny.yaml",
-    ],
-    "small": [
-        "configs/sam2.1_hiera_s.yaml",
-        "configs/sam2.1_hiera_small.yaml",
-        "configs/samurai/sam2.1_hiera_s.yaml",
-        "configs/samurai/sam2.1_hiera_small.yaml",
-    ],
-    "base_plus": [
-        "configs/sam2.1_hiera_b+.yaml",
-        "configs/sam2.1_hiera_base_plus.yaml",
-        "configs/samurai/sam2.1_hiera_b+.yaml",
-        "configs/samurai/sam2.1_hiera_base_plus.yaml",
-    ],
-    "large": [
-        "configs/sam2.1_hiera_l.yaml",
-        "configs/sam2.1_hiera_large.yaml",
-        "configs/samurai/sam2.1_hiera_l.yaml",
-        "configs/samurai/sam2.1_hiera_large.yaml",
-    ],
-}
-
-def _guess_cfg_for_ckpt(ckpt_path: str) -> str | None:
-    name = os.path.basename(ckpt_path).lower()
-    if "tiny" in name or name.endswith("_t.pt"):
-        group = "tiny"
-    elif "small" in name or name.endswith("_s.pt"):
-        group = "small"
-    elif "base_plus" in name or "base-plus" in name or "b_plus" in name or "b+.pt" in name:
-        group = "base_plus"
-    elif "large" in name or name.endswith("_l.pt"):
-        group = "large"
-    else:
-        group = "small"
-    for cand in CFG_CANDIDATES[group]:
-        if os.path.exists(cand):
-            return cand
-    # fallback: just return first; some forks resolve internally
-    return CFG_CANDIDATES[group][0]
-
 # ========= Utilities =========
 def list_checkpoints(ckpt_dir="checkpoints"):
     if not os.path.isdir(ckpt_dir):
@@ -154,6 +108,7 @@ def run_yolo_boxes_rgb(model, rgb_frame, conf=DEFAULT_YOLO_CONF, classes=None, m
     return np.array(out, dtype=np.float32)
 
 def _try_open_writer(base_path, size, fps):
+    """Try multiple codecs; return (writer, final_path)."""
     w, h = size
     attempts = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
     base, _ = os.path.splitext(base_path)
@@ -166,34 +121,66 @@ def _try_open_writer(base_path, size, fps):
         writer.release()
     return None, None
 
-# ========= Discover & build SAM2 (robust to forks) =========
+# ========= Config mapping per README (stable) =========
+def _cfg_from_ckpt(ckpt_path: str) -> str:
+    """
+    Map any of:
+      sam2(_._)?_hiera_tiny/small/base_plus/large.pt
+    → sam2/configs/sam2/sam2_hiera_{t|s|b+|l}.yaml
+    """
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        raise RuntimeError(f"Checkpoint not found: {ckpt_path}")
+    base = os.path.basename(ckpt_path).lower()
+
+    if "tiny" in base or base.endswith("_t.pt") or "_t." in base:
+        variant = "t"
+    elif "small" in base or base.endswith("_s.pt") or "_s." in base:
+        variant = "s"
+    elif "base_plus" in base or "base-plus" in base or "b_plus" in base or "b+.pt" in base:
+        variant = "b+"
+    elif "large" in base or base.endswith("_l.pt") or "_l." in base:
+        variant = "l"
+    else:
+        # safe default: small
+        variant = "s"
+
+    repo_root = os.path.dirname(os.path.dirname(__file__))  # demo/.. = repo root
+    cfg_path = os.path.join(repo_root, "sam2", "configs", "sam2", f"sam2_hiera_{variant}.yaml")
+    if not os.path.exists(cfg_path):
+        raise RuntimeError(
+            f"Expected config YAML at: {cfg_path}\n"
+            f"Make sure your repo contains the README-listed configs under sam2/configs/sam2/."
+        )
+    return cfg_path
+
+# ========= Discover & build SAM2 (robust across forks) =========
 def _has_required_parts(obj):
-    needed = ["image_encoder", "memory_attention", "memory_encoder", "prompt_encoder", "mask_decoder"]
+    needed = ["image_encoder", "memory_attention", "memory_encoder"]
     return all(hasattr(obj, n) for n in needed)
 
 def _discover_and_build_sam2(cfg_path: str, ckpt_path: str):
     """
-    Robustly import sam2.build_sam, find a builder function, and build a model that
-    exposes the pieces SAM2ObjectTracker needs.
+    Import sam2.build_sam, try common builder functions, and return a model
+    that exposes the required encoder modules for SAM2Base.
     """
     try:
         mod = __import__("sam2.build_sam", fromlist=["*"])
     except Exception as e:
         raise ImportError(f"Couldn't import sam2.build_sam: {e}")
 
-    # Candidate functions: any callable with "build" in the name
+    # Gather builder-like functions
     funcs = []
     for name, obj in inspect.getmembers(mod, inspect.isfunction):
         if "build" in name.lower():
             funcs.append((name, obj))
-
     if not funcs:
-        raise ImportError("No builder functions found in sam2.build_sam (expected something like build_sam2 / build_model).")
+        raise ImportError("No builder functions found in sam2.build_sam.")
 
+    # Try (cfg, ckpt) and then keyword forms
     trials = [
         lambda f: f(cfg_path, ckpt_path),
         lambda f: f(config=cfg_path, checkpoint=ckpt_path),
-        lambda f: f(cfg_path),
+        lambda f: f(cfg_path),                    # some builders load ckpt internally via config
         lambda f: f(config=cfg_path),
     ]
 
@@ -208,51 +195,62 @@ def _discover_and_build_sam2(cfg_path: str, ckpt_path: str):
                 last_err = e
                 continue
 
-            # Some builders return a predictor wrapper (.model); others return the model directly
-            candidate_models = []
-            candidate_models.append(built)
+            # Some return wrapper with `.model`, others return the model
+            candidates = [built]
             if hasattr(built, "model"):
-                candidate_models.append(getattr(built, "model"))
+                candidates.append(getattr(built, "model"))
 
-            for m in candidate_models:
+            for m in candidates:
                 if m is None:
                     continue
-                # Already a composite object?
                 if _has_required_parts(m):
-                    print(f"[sam2] using builder `{name}` → direct model")
+                    print(f"[sam2] using builder `{name}` (direct)")
                     return m
-                # Or a namespace with child .model?
+                # Also check common nesting
                 for attr in ["sam", "sam2", "module", "net", "backbone"]:
                     mm = getattr(m, attr, None)
                     if mm is not None and _has_required_parts(mm):
-                        print(f"[sam2] using builder `{name}` → model via `.{attr}`")
+                        print(f"[sam2] using builder `{name}` via `.{attr}`")
                         return mm
 
-    raise RuntimeError(f"Could not build a SAM2 model with required parts from sam2.build_sam (last error: {last_err})")
+    raise RuntimeError(f"Could not build a SAM2 model exposing encoders (last error: {last_err})")
 
-def _guess_cfg_then_build(ckpt_path: str):
-    cfg_path = _guess_cfg_for_ckpt(ckpt_path)
-    print(f"[sam2] cfg guess → {cfg_path}")
-    return _discover_and_build_sam2(cfg_path, ckpt_path)
-
-# ========= Build the tracker properly (WITH model parts) =========
 def _build_tracker_with_model(ckpt_path: str):
     if not ckpt_path or not os.path.exists(ckpt_path):
         raise RuntimeError("Please choose a valid checkpoint (.pt/.pth).")
+    cfg_path = _cfg_from_ckpt(ckpt_path)
+    print(f"[sam2] cfg → {cfg_path}")
 
-    sam2_model = _guess_cfg_then_build(ckpt_path)
+    sam2_model = _discover_and_build_sam2(cfg_path, ckpt_path)
 
-    # Extract parts (already validated by _has_required_parts)
-    tracker = SAM2ObjectTracker(
-        image_encoder=sam2_model.image_encoder,
-        memory_attention=sam2_model.memory_attention,
-        memory_encoder=sam2_model.memory_encoder,
-        prompt_encoder=sam2_model.prompt_encoder,
-        mask_decoder=sam2_model.mask_decoder,
-        num_objects=DEFAULT_NUM_OBJECTS,
-        device=("cuda" if torch.cuda.is_available() else "cpu"),
-    )
-    return tracker
+    # Try most-permissive ctor first (kwargs), then 3-positional fallback
+    try:
+        tracker = SAM2ObjectTracker(
+            image_encoder=sam2_model.image_encoder,
+            memory_attention=sam2_model.memory_attention,
+            memory_encoder=sam2_model.memory_encoder,
+            num_objects=DEFAULT_NUM_OBJECTS,
+            device=("cuda" if torch.cuda.is_available() else "cpu"),
+        )
+        return tracker
+    except TypeError:
+        pass
+
+    try:
+        tracker = SAM2ObjectTracker(
+            sam2_model.image_encoder,
+            sam2_model.memory_attention,
+            sam2_model.memory_encoder,
+        )
+        # best-effort set capacity if exposed
+        if hasattr(tracker, "num_objects"):
+            try:
+                tracker.num_objects = DEFAULT_NUM_OBJECTS
+            except Exception:
+                pass
+        return tracker
+    except Exception as e:
+        raise RuntimeError(f"SAM2ObjectTracker construction failed: {e}")
 
 # ========= App State =========
 state = {
@@ -284,8 +282,10 @@ def _ensure_yolo():
 
 def _reset_session():
     if state["writer"] is not None:
-        try: state["writer"].release()
-        except Exception: pass
+        try:
+            state["writer"].release()
+        except Exception:
+            pass
     state.update({
         "tracker": None,
         "yolo": None,
@@ -368,7 +368,7 @@ def ui_accept():
     (x1,y1),(x2,y2) = state["cands"][idx]
     bbox = np.array([[[x1, y1], [x2, y2]]], dtype=np.float32)
     state["tracker"].track_new_object(state["last_frame"], box=bbox)
-    return f"Added object (curr_obj_idx={state['tracker'].curr_obj_idx}). You can add more whenever you want."
+    return f"Added object (curr_obj_idx={getattr(state['tracker'], 'curr_obj_idx', '?')}). You can add more whenever you want."
 
 def ui_start_tracking():
     if state["tracker"] is None or state["last_frame"] is None:
@@ -377,7 +377,7 @@ def ui_start_tracking():
         return "Add at least one object first (press Accept)."
     state["tracking"] = True
     state["frame_idx"] = 0
-    return f"Tracking started with {state['tracker'].curr_obj_idx} object(s)."
+    return f"Tracking started with {getattr(state['tracker'], 'curr_obj_idx', '?')} object(s)."
 
 def ui_reset():
     _reset_session()
@@ -453,8 +453,10 @@ def start_video(video_file, ckpt, save_name):
 
     cap.release()
     if state["writer"] is not None:
-        try: state["writer"].release()
-        except Exception: pass
+        try:
+            state["writer"].release()
+        except Exception:
+            pass
     yield None, state.get("save_path", None), "Done."
 
 # ========= UI =========
