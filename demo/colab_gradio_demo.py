@@ -1,6 +1,7 @@
 import os
 import cv2
 import time
+import inspect
 import numpy as np
 import torch
 import gradio as gr
@@ -13,49 +14,27 @@ if torch.cuda.is_available():
 
 # ========= Import tracker from your repo =========
 tracker_module = None
-last_import_error = None
+_last_import_error = None
 for mod in ["sam2.sam2_object_tracker", "sam2.tools.sam2_object_tracker"]:
     try:
         tracker_module = __import__(mod, fromlist=["SAM2ObjectTracker"])
         break
     except Exception as e:
-        last_import_error = e
+        _last_import_error = e
 
 if tracker_module is None:
     raise ImportError(
         "Couldn't import SAM2ObjectTracker. Expected sam2.sam2_object_tracker. "
-        f"Last error: {last_import_error}"
+        f"Last error: {_last_import_error}"
     )
 
 SAM2ObjectTracker = getattr(tracker_module, "SAM2ObjectTracker")
-
-# ========= Build SAM2 (model factory) =========
-# We’ll try common factory names present in SAM2 forks.
-build_sam2_model = None
-build_import_error = None
-for mod, name in [
-    ("sam2.build_sam", "build_sam2_model"),
-    ("sam2.build_sam", "build_sam2_camera_predictor"),  # fallback (we won't use camera predictor API, only to access .model)
-]:
-    try:
-        m = __import__(mod, fromlist=[name])
-        build_sam2_model = getattr(m, name)
-        break
-    except Exception as e:
-        build_import_error = e
-        continue
-
-if build_sam2_model is None:
-    raise ImportError(
-        "Couldn't import a SAM2 model builder (tried sam2.build_sam.build_sam2_model / build_sam2_camera_predictor). "
-        f"Last error: {build_import_error}"
-    )
 
 # ========= YOLO (Ultralytics) for proposals =========
 try:
     from ultralytics import YOLO
 except Exception:
-    YOLO = None  # We'll handle gracefully
+    YOLO = None  # handled gracefully
 
 # ========= Defaults (hidden from UI) =========
 DEFAULT_NUM_OBJECTS = 10
@@ -92,24 +71,21 @@ CFG_CANDIDATES = {
 
 def _guess_cfg_for_ckpt(ckpt_path: str) -> str | None:
     name = os.path.basename(ckpt_path).lower()
-    key = None
     if "tiny" in name or name.endswith("_t.pt"):
-        key = "tiny"
+        group = "tiny"
     elif "small" in name or name.endswith("_s.pt"):
-        key = "small"
+        group = "small"
     elif "base_plus" in name or "base-plus" in name or "b_plus" in name or "b+.pt" in name:
-        key = "base_plus"
+        group = "base_plus"
     elif "large" in name or name.endswith("_l.pt"):
-        key = "large"
+        group = "large"
     else:
-        # default to small if unknown
-        key = "small"
-
-    for cand in CFG_CANDIDATES[key]:
+        group = "small"
+    for cand in CFG_CANDIDATES[group]:
         if os.path.exists(cand):
             return cand
-    # If nothing exists, return first candidate (builder may still find it if it uses pkg resources)
-    return CFG_CANDIDATES[key][0]
+    # fallback: just return first; some forks resolve internally
+    return CFG_CANDIDATES[group][0]
 
 # ========= Utilities =========
 def list_checkpoints(ckpt_dir="checkpoints"):
@@ -133,7 +109,7 @@ def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
     except Exception:
         masks = masks_tensor
 
-    if masks.ndim == 4:  # [B,1,H,W]
+    if getattr(masks, "ndim", 0) == 4:  # [B,1,H,W]
         masks = masks[:, 0]
 
     out = frame_rgb.copy()
@@ -190,59 +166,89 @@ def _try_open_writer(base_path, size, fps):
         writer.release()
     return None, None
 
+# ========= Discover & build SAM2 (robust to forks) =========
+def _has_required_parts(obj):
+    needed = ["image_encoder", "memory_attention", "memory_encoder", "prompt_encoder", "mask_decoder"]
+    return all(hasattr(obj, n) for n in needed)
+
+def _discover_and_build_sam2(cfg_path: str, ckpt_path: str):
+    """
+    Robustly import sam2.build_sam, find a builder function, and build a model that
+    exposes the pieces SAM2ObjectTracker needs.
+    """
+    try:
+        mod = __import__("sam2.build_sam", fromlist=["*"])
+    except Exception as e:
+        raise ImportError(f"Couldn't import sam2.build_sam: {e}")
+
+    # Candidate functions: any callable with "build" in the name
+    funcs = []
+    for name, obj in inspect.getmembers(mod, inspect.isfunction):
+        if "build" in name.lower():
+            funcs.append((name, obj))
+
+    if not funcs:
+        raise ImportError("No builder functions found in sam2.build_sam (expected something like build_sam2 / build_model).")
+
+    trials = [
+        lambda f: f(cfg_path, ckpt_path),
+        lambda f: f(config=cfg_path, checkpoint=ckpt_path),
+        lambda f: f(cfg_path),
+        lambda f: f(config=cfg_path),
+    ]
+
+    last_err = None
+    for name, fn in funcs:
+        for t in trials:
+            try:
+                built = t(fn)
+            except TypeError:
+                continue
+            except Exception as e:
+                last_err = e
+                continue
+
+            # Some builders return a predictor wrapper (.model); others return the model directly
+            candidate_models = []
+            candidate_models.append(built)
+            if hasattr(built, "model"):
+                candidate_models.append(getattr(built, "model"))
+
+            for m in candidate_models:
+                if m is None:
+                    continue
+                # Already a composite object?
+                if _has_required_parts(m):
+                    print(f"[sam2] using builder `{name}` → direct model")
+                    return m
+                # Or a namespace with child .model?
+                for attr in ["sam", "sam2", "module", "net", "backbone"]:
+                    mm = getattr(m, attr, None)
+                    if mm is not None and _has_required_parts(mm):
+                        print(f"[sam2] using builder `{name}` → model via `.{attr}`")
+                        return mm
+
+    raise RuntimeError(f"Could not build a SAM2 model with required parts from sam2.build_sam (last error: {last_err})")
+
+def _guess_cfg_then_build(ckpt_path: str):
+    cfg_path = _guess_cfg_for_ckpt(ckpt_path)
+    print(f"[sam2] cfg guess → {cfg_path}")
+    return _discover_and_build_sam2(cfg_path, ckpt_path)
+
 # ========= Build the tracker properly (WITH model parts) =========
 def _build_tracker_with_model(ckpt_path: str):
     if not ckpt_path or not os.path.exists(ckpt_path):
         raise RuntimeError("Please choose a valid checkpoint (.pt/.pth).")
 
-    cfg_path = _guess_cfg_for_ckpt(ckpt_path)
-    print(f"[sam2] using cfg={cfg_path} for ckpt={ckpt_path}")
+    sam2_model = _guess_cfg_then_build(ckpt_path)
 
-    # Build the SAM2 model; different forks support either (cfg, ckpt) or (config, checkpoint)
-    sam2 = None
-    last_err = None
-    try:
-        sam2 = build_sam2_model(cfg_path, ckpt_path)           # common signature
-    except Exception as e1:
-        last_err = e1
-        try:
-            sam2 = build_sam2_model(config=cfg_path, checkpoint=ckpt_path)  # alt signature
-        except Exception as e2:
-            last_err = (e1, e2)
-
-    if sam2 is None:
-        raise RuntimeError(f"Failed to build SAM2 model from cfg+ckpt. Errors: {last_err}")
-
-    # Extract required components (names vary mildly across forks)
-    def pick(obj, *names):
-        for n in names:
-            if hasattr(obj, n):
-                return getattr(obj, n)
-        return None
-
-    image_encoder    = pick(sam2, "image_encoder", "img_encoder", "backbone")
-    memory_attention = pick(sam2, "memory_attention", "mem_attention", "memory_attn")
-    memory_encoder   = pick(sam2, "memory_encoder", "mem_encoder")
-    prompt_encoder   = pick(sam2, "prompt_encoder", "prompt_embedder")
-    mask_decoder     = pick(sam2, "mask_decoder", "sam_mask_decoder", "decoder")
-
-    missing = [n for n, v in [
-        ("image_encoder", image_encoder),
-        ("memory_attention", memory_attention),
-        ("memory_encoder", memory_encoder),
-        ("prompt_encoder", prompt_encoder),
-        ("mask_decoder", mask_decoder),
-    ] if v is None]
-    if missing:
-        raise RuntimeError(f"SAM2 parts missing from model: {missing}")
-
-    # Now create your repo’s tracker with the parts it expects
+    # Extract parts (already validated by _has_required_parts)
     tracker = SAM2ObjectTracker(
-        image_encoder=image_encoder,
-        memory_attention=memory_attention,
-        memory_encoder=memory_encoder,
-        prompt_encoder=prompt_encoder,
-        mask_decoder=mask_decoder,
+        image_encoder=sam2_model.image_encoder,
+        memory_attention=sam2_model.memory_attention,
+        memory_encoder=sam2_model.memory_encoder,
+        prompt_encoder=sam2_model.prompt_encoder,
+        mask_decoder=sam2_model.mask_decoder,
         num_objects=DEFAULT_NUM_OBJECTS,
         device=("cuda" if torch.cuda.is_available() else "cpu"),
     )
@@ -278,10 +284,8 @@ def _ensure_yolo():
 
 def _reset_session():
     if state["writer"] is not None:
-        try:
-            state["writer"].release()
-        except Exception:
-            pass
+        try: state["writer"].release()
+        except Exception: pass
     state.update({
         "tracker": None,
         "yolo": None,
@@ -320,7 +324,7 @@ def process_live_frame(rgb_frame, ckpt):
         pred = state["tracker"].track_all_objects(rgb_frame)
         vis = overlay_masks_rgb(rgb_frame, pred.get("pred_masks_high_res"))
 
-        # draw proposals subtly so user can press Accept mid-stream
+        # draw current proposals subtly so user can press Accept mid-stream
         if len(cands) > 0:
             bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR).copy()
             state["selected_idx"] = max(0, min(state["selected_idx"], len(cands)-1))
@@ -360,12 +364,9 @@ def ui_accept():
         return "No candidate available."
     if state["tracker"] is None:
         return "Tracker not initialized yet."
-
-    idx = state["selected_idx"]
-    idx = max(0, min(idx, len(state["cands"])-1))
+    idx = max(0, min(state["selected_idx"], len(state["cands"])-1))
     (x1,y1),(x2,y2) = state["cands"][idx]
     bbox = np.array([[[x1, y1], [x2, y2]]], dtype=np.float32)
-
     state["tracker"].track_new_object(state["last_frame"], box=bbox)
     return f"Added object (curr_obj_idx={state['tracker'].curr_obj_idx}). You can add more whenever you want."
 
@@ -452,10 +453,8 @@ def start_video(video_file, ckpt, save_name):
 
     cap.release()
     if state["writer"] is not None:
-        try:
-            state["writer"].release()
-        except Exception:
-            pass
+        try: state["writer"].release()
+        except Exception: pass
     yield None, state.get("save_path", None), "Done."
 
 # ========= UI =========
