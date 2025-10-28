@@ -1,7 +1,6 @@
 import os
 import cv2
 import time
-import json
 import numpy as np
 import torch
 import gradio as gr
@@ -57,7 +56,7 @@ def list_checkpoints(ckpt_dir="checkpoints"):
 def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
     """
     frame_rgb: uint8 RGB
-    masks_tensor: torch.Tensor or np.ndarray of shape [B, 1, H, W] or [B, H, W] (logits or probs)
+    masks_tensor: torch.Tensor or np.ndarray [B,1,H,W] or [B,H,W] (logits/probs)
     returns: uint8 RGB
     """
     if masks_tensor is None:
@@ -71,7 +70,7 @@ def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
         masks = masks_tensor
 
     if masks.ndim == 4:  # [B, 1, H, W]
-        masks = masks[:, 0]  # -> [B, H, W]
+        masks = masks[:, 0]
 
     out = frame_rgb.copy()
     H, W = out.shape[:2]
@@ -80,7 +79,6 @@ def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
     B = masks.shape[0] if masks is not None else 0
     for i in range(B):
         m = masks[i]
-        # logits or probs → bin mask
         m_bin = (m > 0.5).astype(np.uint8)
         if m_bin.shape[:2] != (H, W):
             m_bin = cv2.resize(m_bin, (W, H), interpolation=cv2.INTER_NEAREST)
@@ -125,11 +123,8 @@ def _try_open_writer(base_path, size, fps):
     base, _ = os.path.splitext(base_path)
     for fourcc_str, ext in attempts:
         path = base + ext
-        writer = cv2.VideoWriter(cv2.VideoWriter_fourcc(*fourcc_str), fps, (w, h))
-        # compat with OpenCV sig changes
-        if not writer.isOpened():
-            writer.release()
-            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc_str), fps, (w, h))
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
         if writer.isOpened():
             return writer, path
         writer.release()
@@ -152,7 +147,6 @@ state = {
     # live session
     "tracker": None,
     "yolo": None,
-    "first_frame_seeded": False,
     "tracking": False,
     "frame_idx": 0,
 
@@ -209,7 +203,6 @@ def _reset_session():
     state.update({
         "tracker": None,
         "yolo": None,
-        "first_frame_seeded": False,
         "tracking": False,
         "frame_idx": 0,
         "cands": [],
@@ -247,21 +240,19 @@ def process_live_frame(rgb_frame, ckpt, num_objects, device, yolo_on, yolo_model
     # lazy init tracker
     if state["tracker"] is None:
         state["tracker"] = _build_tracker()
-        state["first_frame_seeded"] = False
         state["tracking"] = False
         state["frame_idx"] = 0
 
-    # YOLO proposals (always draw when not tracking; optional while tracking)
+    # YOLO proposals
     try:
         _ensure_yolo()
     except Exception as e:
-        # YOLO optional; ignore errors until user installs
         print("[YOLO init warning]", e)
         state["yolo"] = None
 
     # If tracking: track and overlay
     if state["tracking"]:
-        pred = state["tracker"].track_all_objects(rgb_frame)  # accepts np.ndarray (RGB) → preprocesses inside
+        pred = state["tracker"].track_all_objects(rgb_frame)  # your class accepts np.ndarray RGB
         vis = overlay_masks_rgb(rgb_frame, pred.get("pred_masks_high_res"))
 
         # periodic reinjection (add new objects if capacity left)
@@ -315,8 +306,7 @@ def ui_accept():
     bbox = np.array([[[x1, y1], [x2, y2]]], dtype=np.float32)
 
     # Seed object (this also builds/updates memory & increments curr_obj_idx)
-    out = state["tracker"].track_new_object(state["last_frame"], box=bbox)
-    state["first_frame_seeded"] = True
+    _ = state["tracker"].track_new_object(state["last_frame"], box=bbox)
     return f"Added object (curr_obj_idx={state['tracker'].curr_obj_idx}). You can add more; then press Start Tracking."
 
 def ui_toggle_yolo():
@@ -369,7 +359,6 @@ def start_video(video_file, ckpt, num_objects, device, yolo_on, yolo_model, yolo
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     state["save_fps"] = float(fps)
-    state["saving_enabled"] = True
 
     # init tracker + yolo
     try:
@@ -377,3 +366,146 @@ def start_video(video_file, ckpt, num_objects, device, yolo_on, yolo_model, yolo
     except Exception as e:
         yield None, None, f"Tracker init failed: {e}"
         cap.release()
+        return
+    try:
+        _ensure_yolo()
+    except Exception as e:
+        print("[YOLO init warning]", e)
+        state["yolo"] = None
+
+    # read first frame, show proposals (paused)
+    ok, bgr = cap.read()
+    if not ok:
+        cap.release()
+        yield None, None, "Empty video."
+        return
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    state["last_frame"] = rgb
+
+    # prepare writer (open when we first output segmented frame)
+    w, h = rgb.shape[1], rgb.shape[0]
+    state["writer"], state["save_path"] = _try_open_writer(os.path.join("/tmp", state["save_name"]), (w, h), fps)
+
+    # show first frame with proposals; user can Accept multiple then press start
+    draw = process_live_frame(rgb, ckpt, num_objects, device, yolo_on, yolo_model, yolo_conf, yolo_classes, reinject_every)
+    yield draw, None, "Paused on first frame. Accept multiple objects, then press 'Start Tracking (video)'."
+
+    # wait for tracking flag
+    while not state["tracking"]:
+        time.sleep(0.05)
+        yield process_live_frame(state["last_frame"], ckpt, num_objects, device, yolo_on, yolo_model, yolo_conf, yolo_classes, reinject_every), None, "Waiting…"
+
+    # playback with tracking
+    delay = 1.0 / float(fps)
+    while True:
+        ok, bgr = cap.read()
+        if not ok:
+            break
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        out = process_live_frame(rgb, ckpt, num_objects, device, yolo_on, yolo_model, yolo_conf, yolo_classes, reinject_every)
+        if state["writer"] is not None and out is not None:
+            bgrw = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+            state["writer"].write(bgrw)
+        yield out, None, f"Tracking… frame {state['frame_idx']}"
+        time.sleep(max(0.0, delay * 0.8))
+
+    cap.release()
+    if state["writer"] is not None:
+        try:
+            state["writer"].release()
+        except Exception:
+            pass
+    yield None, state.get("save_path", None), "Done."
+
+# --------------------------
+# UI
+# --------------------------
+CKPTS = list_checkpoints()
+
+with gr.Blocks(title="SAM2 Realtime + KF (Live & Video) — Colab") as demo:
+    gr.Markdown("## SAM2 Realtime + Kalman Filter — Live webcam frames & Video file (with YOLO seeding)")
+
+    with gr.Tabs():
+        # LIVE TAB
+        with gr.Tab("Live (webcam frames)"):
+            with gr.Row():
+                ckpt = gr.Dropdown(choices=CKPTS, value=CKPTS[0] if CKPTS else None, label="Checkpoint (.pt/.pth)")
+                num_obj = gr.Slider(1, 16, value=4, step=1, label="Max objects")
+                device = gr.Radio(choices=["cuda","cpu"], value="cuda" if torch.cuda.is_available() else "cpu", label="Device")
+            with gr.Accordion("YOLO settings", open=True):
+                y_enable = gr.Checkbox(value=True, label="Use YOLO proposals")
+                y_model  = gr.Textbox(value="yolov8n.pt", label="YOLO model (name/path)")
+                y_conf   = gr.Slider(0.05, 0.9, value=0.25, step=0.05, label="YOLO conf")
+                y_classes= gr.Textbox(value="", label="Class IDs (comma-separated, empty=all)")
+                reinject = gr.Number(value=60, label="Re-inject every N frames (0=off)")
+
+            cam = gr.Image(sources=["webcam"], streaming=True, label="Webcam", type="numpy")
+            out_live = gr.Image(label="Output (live)")
+
+            with gr.Row():
+                btn_prev   = gr.Button("Prev proposal")
+                btn_accept = gr.Button("Accept (add object)")
+                btn_next   = gr.Button("Next proposal")
+                btn_toggle = gr.Button("Toggle YOLO")
+                btn_start  = gr.Button("Start Tracking")
+                btn_reset  = gr.Button("Reset session")
+            live_status = gr.Markdown("Status: waiting…")
+
+            cam.stream(
+                fn=process_live_frame,
+                inputs=[cam, ckpt, num_obj, device, y_enable, y_model, y_conf, y_classes, reinject],
+                outputs=out_live
+            )
+            btn_next.click(fn=ui_next, inputs=None, outputs=None)
+            btn_prev.click(fn=ui_prev, inputs=None, outputs=None)
+            btn_accept.click(fn=ui_accept, inputs=None, outputs=live_status)
+            btn_toggle.click(fn=ui_toggle_yolo, inputs=None, outputs=live_status)
+            btn_start.click(fn=ui_start_tracking, inputs=None, outputs=live_status)
+            btn_reset.click(fn=ui_reset, inputs=None, outputs=live_status)
+
+        # VIDEO TAB
+        with gr.Tab("Video file"):
+            vid = gr.File(label="Video file", file_types=["video"])
+            with gr.Row():
+                ckpt_v = gr.Dropdown(choices=CKPTS, value=CKPTS[0] if CKPTS else None, label="Checkpoint (.pt/.pth)")
+                num_obj_v = gr.Slider(1, 16, value=4, step=1, label="Max objects")
+                device_v = gr.Radio(choices=["cuda","cpu"], value="cuda" if torch.cuda.is_available() else "cpu", label="Device")
+            with gr.Accordion("YOLO settings", open=True):
+                y_enable_v = gr.Checkbox(value=True, label="Use YOLO proposals")
+                y_model_v  = gr.Textbox(value="yolov8n.pt", label="YOLO model (name/path)")
+                y_conf_v   = gr.Slider(0.05, 0.9, value=0.25, step=0.05, label="YOLO conf")
+                y_classes_v= gr.Textbox(value="", label="Class IDs (comma-separated, empty=all)")
+                reinject_v = gr.Number(value=60, label="Re-inject every N frames (0=off)")
+            save_name = gr.Textbox(value="segmented_output", label="Output base filename (auto-saved to /tmp)")
+            out_vid = gr.Image(label="Output (video)")
+            download = gr.File(label="Download segmented video (appears when finished)")
+            status_v = gr.Markdown("")
+
+            btn_start_vid = gr.Button("Start Tracking (video)")
+            btn_start_vid.click(
+                fn=start_video,
+                inputs=[vid, ckpt_v, num_obj_v, device_v, y_enable_v, y_model_v, y_conf_v, y_classes_v, reinject_v, save_name],
+                outputs=[out_vid, download, status_v]
+            )
+
+    gr.Markdown("""
+**How to use**
+- **Live tab:** select a checkpoint → YOLO boxes appear → click **Accept** to add one or more objects → **Start Tracking**.
+- **Video tab:** upload a file → first frame shows proposals and waits → **Accept** multiple → **Start Tracking (video)**. A download link appears when done.
+""")
+
+# Make sure Colab prints URLs reliably
+if __name__ == "__main__":
+    app, local_url, share_url = demo.queue().launch(
+        share=True,
+        debug=True,
+        show_error=True,
+        server_name="0.0.0.0",
+        server_port=7860,
+        prevent_thread_lock=True,
+    )
+    print("Local URL:", local_url)
+    print("Share URL:", share_url)
+    # keep process alive
+    while True:
+        time.sleep(60)
