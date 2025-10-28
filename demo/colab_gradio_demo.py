@@ -29,6 +29,28 @@ if tracker_module is None:
 
 SAM2ObjectTracker = getattr(tracker_module, "SAM2ObjectTracker")
 
+# ========= Build SAM2 (model factory) =========
+# We’ll try common factory names present in SAM2 forks.
+build_sam2_model = None
+build_import_error = None
+for mod, name in [
+    ("sam2.build_sam", "build_sam2_model"),
+    ("sam2.build_sam", "build_sam2_camera_predictor"),  # fallback (we won't use camera predictor API, only to access .model)
+]:
+    try:
+        m = __import__(mod, fromlist=[name])
+        build_sam2_model = getattr(m, name)
+        break
+    except Exception as e:
+        build_import_error = e
+        continue
+
+if build_sam2_model is None:
+    raise ImportError(
+        "Couldn't import a SAM2 model builder (tried sam2.build_sam.build_sam2_model / build_sam2_camera_predictor). "
+        f"Last error: {build_import_error}"
+    )
+
 # ========= YOLO (Ultralytics) for proposals =========
 try:
     from ultralytics import YOLO
@@ -36,9 +58,58 @@ except Exception:
     YOLO = None  # We'll handle gracefully
 
 # ========= Defaults (hidden from UI) =========
-DEFAULT_NUM_OBJECTS = 10          # tracker capacity
-DEFAULT_YOLO_MODEL = "yolov8n.pt" # small, downloads automatically
-DEFAULT_YOLO_CONF = 0.25          # proposals threshold
+DEFAULT_NUM_OBJECTS = 10
+DEFAULT_YOLO_MODEL = "yolov8n.pt"
+DEFAULT_YOLO_CONF = 0.25
+
+# Try these CFG paths in order (they vary across forks).
+CFG_CANDIDATES = {
+    "tiny": [
+        "configs/sam2.1_hiera_t.yaml",
+        "configs/sam2.1_hiera_tiny.yaml",
+        "configs/samurai/sam2.1_hiera_t.yaml",
+        "configs/samurai/sam2.1_hiera_tiny.yaml",
+    ],
+    "small": [
+        "configs/sam2.1_hiera_s.yaml",
+        "configs/sam2.1_hiera_small.yaml",
+        "configs/samurai/sam2.1_hiera_s.yaml",
+        "configs/samurai/sam2.1_hiera_small.yaml",
+    ],
+    "base_plus": [
+        "configs/sam2.1_hiera_b+.yaml",
+        "configs/sam2.1_hiera_base_plus.yaml",
+        "configs/samurai/sam2.1_hiera_b+.yaml",
+        "configs/samurai/sam2.1_hiera_base_plus.yaml",
+    ],
+    "large": [
+        "configs/sam2.1_hiera_l.yaml",
+        "configs/sam2.1_hiera_large.yaml",
+        "configs/samurai/sam2.1_hiera_l.yaml",
+        "configs/samurai/sam2.1_hiera_large.yaml",
+    ],
+}
+
+def _guess_cfg_for_ckpt(ckpt_path: str) -> str | None:
+    name = os.path.basename(ckpt_path).lower()
+    key = None
+    if "tiny" in name or name.endswith("_t.pt"):
+        key = "tiny"
+    elif "small" in name or name.endswith("_s.pt"):
+        key = "small"
+    elif "base_plus" in name or "base-plus" in name or "b_plus" in name or "b+.pt" in name:
+        key = "base_plus"
+    elif "large" in name or name.endswith("_l.pt"):
+        key = "large"
+    else:
+        # default to small if unknown
+        key = "small"
+
+    for cand in CFG_CANDIDATES[key]:
+        if os.path.exists(cand):
+            return cand
+    # If nothing exists, return first candidate (builder may still find it if it uses pkg resources)
+    return CFG_CANDIDATES[key][0]
 
 # ========= Utilities =========
 def list_checkpoints(ckpt_dir="checkpoints"):
@@ -52,11 +123,6 @@ def list_checkpoints(ckpt_dir="checkpoints"):
     return sorted(files)
 
 def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
-    """
-    frame_rgb: uint8 RGB
-    masks_tensor: torch.Tensor or np.ndarray [B,1,H,W] or [B,H,W] (logits/probs)
-    returns: uint8 RGB
-    """
     if masks_tensor is None:
         return frame_rgb
     try:
@@ -67,7 +133,7 @@ def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
     except Exception:
         masks = masks_tensor
 
-    if masks.ndim == 4:  # [B, 1, H, W]
+    if masks.ndim == 4:  # [B,1,H,W]
         masks = masks[:, 0]
 
     out = frame_rgb.copy()
@@ -82,7 +148,7 @@ def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
             m_bin = cv2.resize(m_bin, (W, H), interpolation=cv2.INTER_NEAREST)
 
         rng = np.random.default_rng((i + 1) * 2654435761 % (2**32))
-        color = tuple(int(x) for x in rng.integers(60, 255, size=3))  # RGB
+        color = tuple(int(x) for x in rng.integers(60, 255, size=3))
         colored = np.zeros_like(out, dtype=np.uint8)
         colored[:, :] = color
 
@@ -100,9 +166,6 @@ def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
     return out
 
 def run_yolo_boxes_rgb(model, rgb_frame, conf=DEFAULT_YOLO_CONF, classes=None, max_det=100):
-    """
-    Returns boxes as np.ndarray (n,2,2) in ABSOLUTE pixels [[(x1,y1),(x2,y2)], ...]
-    """
     if model is None or rgb_frame is None:
         return np.zeros((0, 2, 2), dtype=np.float32)
     res = model.predict(rgb_frame, conf=float(conf), classes=classes, max_det=int(max_det), verbose=False)
@@ -115,7 +178,6 @@ def run_yolo_boxes_rgb(model, rgb_frame, conf=DEFAULT_YOLO_CONF, classes=None, m
     return np.array(out, dtype=np.float32)
 
 def _try_open_writer(base_path, size, fps):
-    """Try multiple codecs; return (writer, final_path)."""
     w, h = size
     attempts = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
     base, _ = os.path.splitext(base_path)
@@ -128,62 +190,67 @@ def _try_open_writer(base_path, size, fps):
         writer.release()
     return None, None
 
-# ---- checkpoint loader (post-construction) ----
-def _smart_load_ckpt(tracker, ckpt_path, device="cuda"):
-    if not ckpt_path:
-        return "No checkpoint provided; using tracker defaults."
+# ========= Build the tracker properly (WITH model parts) =========
+def _build_tracker_with_model(ckpt_path: str):
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        raise RuntimeError("Please choose a valid checkpoint (.pt/.pth).")
 
-    map_loc = (device if device in ("cpu", "cuda") else "cpu")
-    try:
-        sd = torch.load(ckpt_path, map_location=map_loc)
-    except Exception as e:
-        return f"WARNING: could not read weights file: {e}"
+    cfg_path = _guess_cfg_for_ckpt(ckpt_path)
+    print(f"[sam2] using cfg={cfg_path} for ckpt={ckpt_path}")
 
-    candidates = []
-    if isinstance(sd, dict):
-        candidates.extend([sd.get("model"), sd.get("state_dict"), sd])
-    else:
-        candidates.append(sd)
-
-    targets = [
-        ("tracker", tracker),
-        ("tracker.model", getattr(tracker, "model", None)),
-        ("tracker.module", getattr(tracker, "module", None)),
-    ]
-
+    # Build the SAM2 model; different forks support either (cfg, ckpt) or (config, checkpoint)
+    sam2 = None
     last_err = None
-    for payload in candidates:
-        if not isinstance(payload, dict):
-            continue
-        for name, tgt in targets:
-            if tgt is None or not hasattr(tgt, "load_state_dict"):
-                continue
-            try:
-                missing, unexpected = tgt.load_state_dict(payload, strict=False)
-                return f"Loaded weights into {name} (missing={len(missing)}, unexpected={len(unexpected)})."
-            except Exception as e:
-                last_err = e
-                continue
+    try:
+        sam2 = build_sam2_model(cfg_path, ckpt_path)           # common signature
+    except Exception as e1:
+        last_err = e1
+        try:
+            sam2 = build_sam2_model(config=cfg_path, checkpoint=ckpt_path)  # alt signature
+        except Exception as e2:
+            last_err = (e1, e2)
 
-    for meth in ("load_checkpoint", "load_weights", "load_from_checkpoint"):
-        if hasattr(tracker, meth):
-            try:
-                getattr(tracker, meth)(ckpt_path)
-                return f"Loaded weights via tracker.{meth}()."
-            except Exception as e:
-                last_err = e
-                continue
+    if sam2 is None:
+        raise RuntimeError(f"Failed to build SAM2 model from cfg+ckpt. Errors: {last_err}")
 
-    return f"WARNING: could not load weights from {ckpt_path} (last error: {last_err})"
+    # Extract required components (names vary mildly across forks)
+    def pick(obj, *names):
+        for n in names:
+            if hasattr(obj, n):
+                return getattr(obj, n)
+        return None
+
+    image_encoder    = pick(sam2, "image_encoder", "img_encoder", "backbone")
+    memory_attention = pick(sam2, "memory_attention", "mem_attention", "memory_attn")
+    memory_encoder   = pick(sam2, "memory_encoder", "mem_encoder")
+    prompt_encoder   = pick(sam2, "prompt_encoder", "prompt_embedder")
+    mask_decoder     = pick(sam2, "mask_decoder", "sam_mask_decoder", "decoder")
+
+    missing = [n for n, v in [
+        ("image_encoder", image_encoder),
+        ("memory_attention", memory_attention),
+        ("memory_encoder", memory_encoder),
+        ("prompt_encoder", prompt_encoder),
+        ("mask_decoder", mask_decoder),
+    ] if v is None]
+    if missing:
+        raise RuntimeError(f"SAM2 parts missing from model: {missing}")
+
+    # Now create your repo’s tracker with the parts it expects
+    tracker = SAM2ObjectTracker(
+        image_encoder=image_encoder,
+        memory_attention=memory_attention,
+        memory_encoder=memory_encoder,
+        prompt_encoder=prompt_encoder,
+        mask_decoder=mask_decoder,
+        num_objects=DEFAULT_NUM_OBJECTS,
+        device=("cuda" if torch.cuda.is_available() else "cpu"),
+    )
+    return tracker
 
 # ========= App State =========
 state = {
-    # hidden options / defaults
     "ckpt": None,
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "num_objects": DEFAULT_NUM_OBJECTS,
-
-    # runtime
     "tracker": None,
     "yolo": None,
     "tracking": False,
@@ -209,17 +276,6 @@ def _ensure_yolo():
         m.model_name = DEFAULT_YOLO_MODEL
         state["yolo"] = m
 
-def _build_tracker():
-    # Construct WITHOUT checkpoint kwargs (your base doesn't accept them)
-    try:
-        t = SAM2ObjectTracker(num_objects=int(state["num_objects"]))
-    except TypeError:
-        t = SAM2ObjectTracker()
-    # Post-load checkpoint
-    msg = _smart_load_ckpt(t, state["ckpt"], device=state["device"])
-    print("[ckpt]", msg)
-    return t
-
 def _reset_session():
     if state["writer"] is not None:
         try:
@@ -238,27 +294,21 @@ def _reset_session():
         "save_path": None,
     })
 
-# ========= LIVE: per-frame handler (user-driven prompts only) =========
+# ========= LIVE: per-frame handler (manual prompts only) =========
 @torch.inference_mode()
 def process_live_frame(rgb_frame, ckpt):
-    """
-    Receives frames from gr.Image(sources=["webcam"], streaming=True)
-    User only decides when to press 'Accept (add object)' or 'Start Tracking'.
-    """
     state["ckpt"] = ckpt
-
     if rgb_frame is None or ckpt is None:
         return None
 
     state["last_frame"] = rgb_frame
 
-    # lazy init
+    # lazy init tracker and yolo
     if state["tracker"] is None:
-        state["tracker"] = _build_tracker()
+        state["tracker"] = _build_tracker_with_model(state["ckpt"])
         state["tracking"] = False
         state["frame_idx"] = 0
 
-    # proposals (always visible to allow manual Accept any time)
     try:
         _ensure_yolo()
         cands = state["cands"] = run_yolo_boxes_rgb(state["yolo"], rgb_frame, conf=DEFAULT_YOLO_CONF)
@@ -270,7 +320,7 @@ def process_live_frame(rgb_frame, ckpt):
         pred = state["tracker"].track_all_objects(rgb_frame)
         vis = overlay_masks_rgb(rgb_frame, pred.get("pred_masks_high_res"))
 
-        # draw current proposals subtly (so user can add mid-stream)
+        # draw proposals subtly so user can press Accept mid-stream
         if len(cands) > 0:
             bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR).copy()
             state["selected_idx"] = max(0, min(state["selected_idx"], len(cands)-1))
@@ -306,9 +356,6 @@ def ui_prev():
     return gr.update()
 
 def ui_accept():
-    """
-    Add the selected YOLO box as a new object (allowed before or during tracking).
-    """
     if state["last_frame"] is None or not state["cands"]:
         return "No candidate available."
     if state["tracker"] is None:
@@ -325,7 +372,7 @@ def ui_accept():
 def ui_start_tracking():
     if state["tracker"] is None or state["last_frame"] is None:
         return "Tracker not ready."
-    if state["tracker"].curr_obj_idx == 0:
+    if getattr(state["tracker"], "curr_obj_idx", 0) == 0:
         return "Add at least one object first (press Accept)."
     state["tracking"] = True
     state["frame_idx"] = 0
@@ -358,20 +405,19 @@ def start_video(video_file, ckpt, save_name):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     state["save_fps"] = float(fps)
 
-    # init tracker + yolo
     try:
-        state["tracker"] = _build_tracker()
+        state["tracker"] = _build_tracker_with_model(state["ckpt"])
     except Exception as e:
         yield None, None, f"Tracker init failed: {e}"
         cap.release()
         return
+
     try:
         _ensure_yolo()
     except Exception as e:
         print("[YOLO warning]", e)
         state["yolo"] = None
 
-    # read first frame, show proposals (paused)
     ok, bgr = cap.read()
     if not ok:
         cap.release()
@@ -380,21 +426,17 @@ def start_video(video_file, ckpt, save_name):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     state["last_frame"] = rgb
 
-    # prepare writer
     w, h = rgb.shape[1], rgb.shape[0]
     writer, path_out = _try_open_writer(os.path.join("/tmp", state["save_name"]), (w, h), fps)
     state["writer"], state["save_path"] = writer, path_out
 
-    # show first frame with proposals; user can Accept multiple then press start
     draw = process_live_frame(rgb, ckpt)
     yield draw, None, "Paused on first frame. Press **Accept** to add objects, then **Start Tracking (video)**."
 
-    # wait for tracking flag
     while not state["tracking"]:
         time.sleep(0.05)
         yield process_live_frame(state["last_frame"], ckpt), None, "Waiting…"
 
-    # playback with tracking
     delay = 1.0 / float(fps)
     while True:
         ok, bgr = cap.read()
@@ -416,7 +458,7 @@ def start_video(video_file, ckpt, save_name):
             pass
     yield None, state.get("save_path", None), "Done."
 
-# ========= UI (minimal knobs) =========
+# ========= UI =========
 CKPTS = list_checkpoints()
 
 with gr.Blocks(title="SAM2 Realtime + KF — Live & Video (YOLO-assisted, user prompts only)") as demo:
@@ -465,7 +507,7 @@ with gr.Blocks(title="SAM2 Realtime + KF — Live & Video (YOLO-assisted, user p
     gr.Markdown("""
 **How to use**
 - **Live:** pick a checkpoint → YOLO proposals appear → press **Accept** to add an object whenever you want → **Start Tracking**.  
-  You can keep pressing **Accept** mid-stream to add more (capacity is 10 by default).
+  You can keep pressing **Accept** mid-stream to add more (capacity ~10 by default).
 - **Video:** upload clip → first frame pauses → **Accept** a few → **Start Tracking (video)** → a download link appears when done.
 """)
 
