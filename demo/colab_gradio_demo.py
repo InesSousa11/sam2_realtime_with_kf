@@ -1,18 +1,16 @@
-import os
-import cv2
-import time
-import inspect
+import os, cv2, time, inspect
 import numpy as np
 import torch
 import gradio as gr
+from typing import Optional
 
-# ========= Perf knobs (safe on CPU too) =========
+# ===== Perf knobs (safe on CPU) =====
 if torch.cuda.is_available():
     torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# ========= Import tracker from your repo =========
+# ===== Import tracker =====
 tracker_module = None
 _last_import_error = None
 for mod in ["sam2.sam2_object_tracker", "sam2.tools.sam2_object_tracker"]:
@@ -21,27 +19,68 @@ for mod in ["sam2.sam2_object_tracker", "sam2.tools.sam2_object_tracker"]:
         break
     except Exception as e:
         _last_import_error = e
-
 if tracker_module is None:
     raise ImportError(
         "Couldn't import SAM2ObjectTracker. Expected sam2.sam2_object_tracker. "
         f"Last error: {_last_import_error}"
     )
-
 SAM2ObjectTracker = getattr(tracker_module, "SAM2ObjectTracker")
 
-# ========= YOLO (Ultralytics) for proposals =========
+# ===== YOLO (proposals) =====
 try:
     from ultralytics import YOLO
 except Exception:
-    YOLO = None  # handled gracefully
+    YOLO = None  # optional
 
-# ========= Defaults (hidden from UI) =========
+# ===== New: Hydra/OmegaConf loader =====
+from omegaconf import OmegaConf
+
+# ===== Defaults =====
 DEFAULT_NUM_OBJECTS = 10
 DEFAULT_YOLO_MODEL = "yolov8n.pt"
 DEFAULT_YOLO_CONF = 0.25
 
-# ========= Utilities =========
+CFG_CANDIDATES = {
+    "tiny": [
+        "sam2/configs/sam2/sam2_hiera_t.yaml",
+        "configs/sam2.1_hiera_t.yaml", "configs/samurai/sam2.1_hiera_t.yaml",
+    ],
+    "small": [
+        "sam2/configs/sam2/sam2_hiera_s.yaml",
+        "configs/sam2.1_hiera_s.yaml", "configs/samurai/sam2.1_hiera_s.yaml",
+    ],
+    "base_plus": [
+        "sam2/configs/sam2/sam2_hiera_b+.yaml",
+        "configs/sam2.1_hiera_b+.yaml", "configs/sam2.1_hiera_base_plus.yaml",
+        "configs/samurai/sam2.1_hiera_b+.yaml",
+    ],
+    "large": [
+        "sam2/configs/sam2/sam2_hiera_l.yaml",
+        "configs/sam2.1_hiera_l.yaml", "configs/samurai/sam2.1_hiera_l.yaml",
+    ],
+}
+
+def _guess_cfg_for_ckpt(ckpt_path: str) -> tuple[str, str]:
+    """Return (cfg_path_to_load, cfg_basename_for_builder)."""
+    name = os.path.basename(ckpt_path).lower()
+    if "tiny" in name or name.endswith("_t.pt"):
+        group = "tiny"
+    elif "small" in name or name.endswith("_s.pt"):
+        group = "small"
+    elif "base_plus" in name or "base-plus" in name or "b_plus" in name or "b+.pt" in name:
+        group = "base_plus"
+    elif "large" in name or name.endswith("_l.pt"):
+        group = "large"
+    else:
+        group = "small"
+    for cand in CFG_CANDIDATES[group]:
+        if os.path.exists(cand):
+            return cand, os.path.basename(cand)
+    # fallback to first candidate (basename may resolve inside builder)
+    cand = CFG_CANDIDATES[group][0]
+    return cand, os.path.basename(cand)
+
+# ===== Utils =====
 def list_checkpoints(ckpt_dir="checkpoints"):
     if not os.path.isdir(ckpt_dir):
         return []
@@ -62,36 +101,22 @@ def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
             masks = masks_tensor
     except Exception:
         masks = masks_tensor
-
     if getattr(masks, "ndim", 0) == 4:  # [B,1,H,W]
         masks = masks[:, 0]
-
     out = frame_rgb.copy()
     H, W = out.shape[:2]
     overlay = np.zeros_like(out, dtype=np.uint8)
-
     B = masks.shape[0] if masks is not None else 0
     for i in range(B):
         m = masks[i]
         m_bin = (m > 0.5).astype(np.uint8)
         if m_bin.shape[:2] != (H, W):
             m_bin = cv2.resize(m_bin, (W, H), interpolation=cv2.INTER_NEAREST)
-
         rng = np.random.default_rng((i + 1) * 2654435761 % (2**32))
         color = tuple(int(x) for x in rng.integers(60, 255, size=3))
-        colored = np.zeros_like(out, dtype=np.uint8)
-        colored[:, :] = color
-
+        colored = np.zeros_like(out, dtype=np.uint8); colored[:, :] = color
         mask3 = np.repeat(m_bin[:, :, None], 3, axis=2)
         overlay = np.where(mask3 > 0, colored, overlay)
-
-        ys, xs = np.where(m_bin > 0)
-        if len(xs) > 0:
-            cx, cy = int(xs.mean()), int(ys.mean())
-            cv2.circle(out, (cx, cy), 7, (255, 255, 255), -1)
-            cv2.putText(out, f"ID {i}", (cx + 10, cy - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30), 2, cv2.LINE_AA)
-
     cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0, out)
     return out
 
@@ -108,7 +133,6 @@ def run_yolo_boxes_rgb(model, rgb_frame, conf=DEFAULT_YOLO_CONF, classes=None, m
     return np.array(out, dtype=np.float32)
 
 def _try_open_writer(base_path, size, fps):
-    """Try multiple codecs; return (writer, final_path)."""
     w, h = size
     attempts = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
     base, _ = os.path.splitext(base_path)
@@ -121,210 +145,139 @@ def _try_open_writer(base_path, size, fps):
         writer.release()
     return None, None
 
-# ========= Config mapping per README (stable) =========
-def _cfg_from_ckpt(ckpt_path: str) -> str:
-    """
-    Map any of:
-      sam2(_._)?_hiera_tiny/small/base_plus/large.pt
-    → sam2/configs/sam2/sam2_hiera_{t|s|b+|l}.yaml
-    """
-    if not ckpt_path or not os.path.exists(ckpt_path):
-        raise RuntimeError(f"Checkpoint not found: {ckpt_path}")
-    base = os.path.basename(ckpt_path).lower()
+# ===== Discover & build SAM2 model safely =====
+def _load_cfg_object(cfg_path_or_basename: str):
+    """Try OmegaConf.load on path; if that fails, try to locate under ./ or ./sam2/configs/sam2/."""
+    try:
+        if os.path.exists(cfg_path_or_basename):
+            return OmegaConf.load(cfg_path_or_basename)
+    except Exception:
+        pass
+    # try common roots
+    for root in ["", "sam2/configs/sam2", "configs", "configs/samurai", "sam2/configs"]:
+        p = os.path.join(root, cfg_path_or_basename)
+        if os.path.exists(p):
+            try:
+                return OmegaConf.load(p)
+            except Exception:
+                continue
+    return None  # builder may still handle just the basename
 
-    if "tiny" in base or base.endswith("_t.pt") or "_t." in base:
-        variant = "t"
-    elif "small" in base or base.endswith("_s.pt") or "_s." in base:
-        variant = "s"
-    elif "base_plus" in base or "base-plus" in base or "b_plus" in base or "b+.pt" in base:
-        variant = "b+"
-    elif "large" in base or base.endswith("_l.pt") or "_l." in base:
-        variant = "l"
-    else:
-        # safe default: small
-        variant = "s"
-
-    repo_root = os.path.dirname(os.path.dirname(__file__))  # demo/.. = repo root
-    cfg_path = os.path.join(repo_root, "sam2", "configs", "sam2", f"sam2_hiera_{variant}.yaml")
-    if not os.path.exists(cfg_path):
-        raise RuntimeError(
-            f"Expected config YAML at: {cfg_path}\n"
-            f"Make sure your repo contains the README-listed configs under sam2/configs/sam2/."
-        )
-    return cfg_path
-
-# ========= Discover & build SAM2 (robust across forks) =========
-def _has_required_parts(obj):
-    needed = ["image_encoder", "memory_attention", "memory_encoder"]
-    return all(hasattr(obj, n) for n in needed)
-
-def _discover_and_build_sam2(cfg_path: str, ckpt_path: str):
-    """
-    Import sam2.build_sam, try common builder functions, and return a model
-    that exposes the required encoder modules for SAM2Base.
-    """
+def _discover_and_build_sam2(cfg_path_to_load: str, cfg_basename_for_builder: str, ckpt_path: str):
     try:
         mod = __import__("sam2.build_sam", fromlist=["*"])
     except Exception as e:
         raise ImportError(f"Couldn't import sam2.build_sam: {e}")
 
-    # Gather builder-like functions
-    funcs = []
-    for name, obj in inspect.getmembers(mod, inspect.isfunction):
-        if "build" in name.lower():
-            funcs.append((name, obj))
-    if not funcs:
-        raise ImportError("No builder functions found in sam2.build_sam.")
-
-    # Try (cfg, ckpt) and then keyword forms
-    trials = [
-        lambda f: f(cfg_path, ckpt_path),
-        lambda f: f(config=cfg_path, checkpoint=ckpt_path),
-        lambda f: f(cfg_path),                    # some builders load ckpt internally via config
-        lambda f: f(config=cfg_path),
-    ]
+    cfg_obj = _load_cfg_object(cfg_path_to_load)  # may be None
+    trials = []  # (callable, description)
+    # Most likely signatures across forks:
+    for name, fn in inspect.getmembers(mod, inspect.isfunction):
+        lower = name.lower()
+        if "build" not in lower:
+            continue
+        # pass cfg object first
+        trials += [
+            (lambda f=fn: f(cfg_obj, ckpt_path), f"{name}(cfg_obj, ckpt)"),
+            (lambda f=fn: f(config=cfg_obj, checkpoint=ckpt_path), f"{name}(config=cfg_obj, checkpoint=...)"),
+            # pass basename (Hydra-style resolver)
+            (lambda f=fn: f(cfg_basename_for_builder, ckpt_path), f"{name}('basename', ckpt)"),
+            (lambda f=fn: f(config=cfg_basename_for_builder, checkpoint=ckpt_path), f"{name}(config='basename', checkpoint=...)"),
+            # some builders accept only cfg and then you load state later; try it anyway
+            (lambda f=fn: f(cfg_obj), f"{name}(cfg_obj)"),
+            (lambda f=fn: f(cfg_basename_for_builder), f"{name}('basename')"),
+        ]
 
     last_err = None
-    for name, fn in funcs:
-        for t in trials:
-            try:
-                built = t(fn)
-            except TypeError:
-                continue
-            except Exception as e:
-                last_err = e
-                continue
+    for caller, desc in trials:
+        try:
+            built = caller()
+        except TypeError:
+            continue
+        except Exception as e:
+            last_err = e
+            continue
 
-            # Some return wrapper with `.model`, others return the model
-            candidates = [built]
-            if hasattr(built, "model"):
-                candidates.append(getattr(built, "model"))
+        # unwrap common holders
+        candidates = [built]
+        for attr in ["model", "sam", "sam2", "module", "net"]:
+            if hasattr(built, attr):
+                candidates.append(getattr(built, attr))
 
-            for m in candidates:
-                if m is None:
-                    continue
-                if _has_required_parts(m):
-                    print(f"[sam2] using builder `{name}` (direct)")
-                    return m
-                # Also check common nesting
-                for attr in ["sam", "sam2", "module", "net", "backbone"]:
-                    mm = getattr(m, attr, None)
-                    if mm is not None and _has_required_parts(mm):
-                        print(f"[sam2] using builder `{name}` via `.{attr}`")
-                        return mm
+        def _has_parts(m):
+            needed = ["image_encoder", "memory_attention", "memory_encoder", "prompt_encoder", "mask_decoder"]
+            return m is not None and all(hasattr(m, k) for k in needed)
+
+        for m in candidates:
+            if _has_parts(m):
+                print(f"[sam2] using builder → {desc}")
+                return m
 
     raise RuntimeError(f"Could not build a SAM2 model exposing encoders (last error: {last_err})")
 
 def _build_tracker_with_model(ckpt_path: str):
     if not ckpt_path or not os.path.exists(ckpt_path):
-        raise RuntimeError("Please choose a valid checkpoint (.pt/.pth).")
-    cfg_path = _cfg_from_ckpt(ckpt_path)
-    print(f"[sam2] cfg → {cfg_path}")
+        raise RuntimeError("Choose a valid checkpoint (.pt/.pth).")
+    cfg_path, cfg_base = _guess_cfg_for_ckpt(ckpt_path)
+    print(f"[sam2] cfg → {os.path.abspath(cfg_path)}")
+    model = _discover_and_build_sam2(cfg_path, cfg_base, ckpt_path)
+    tracker = SAM2ObjectTracker(
+        image_encoder=model.image_encoder,
+        memory_attention=model.memory_attention,
+        memory_encoder=model.memory_encoder,
+        prompt_encoder=model.prompt_encoder,
+        mask_decoder=model.mask_decoder,
+        num_objects=DEFAULT_NUM_OBJECTS,
+        device=("cuda" if torch.cuda.is_available() else "cpu"),
+    )
+    return tracker
 
-    sam2_model = _discover_and_build_sam2(cfg_path, ckpt_path)
-
-    # Try most-permissive ctor first (kwargs), then 3-positional fallback
-    try:
-        tracker = SAM2ObjectTracker(
-            image_encoder=sam2_model.image_encoder,
-            memory_attention=sam2_model.memory_attention,
-            memory_encoder=sam2_model.memory_encoder,
-            num_objects=DEFAULT_NUM_OBJECTS,
-            device=("cuda" if torch.cuda.is_available() else "cpu"),
-        )
-        return tracker
-    except TypeError:
-        pass
-
-    try:
-        tracker = SAM2ObjectTracker(
-            sam2_model.image_encoder,
-            sam2_model.memory_attention,
-            sam2_model.memory_encoder,
-        )
-        # best-effort set capacity if exposed
-        if hasattr(tracker, "num_objects"):
-            try:
-                tracker.num_objects = DEFAULT_NUM_OBJECTS
-            except Exception:
-                pass
-        return tracker
-    except Exception as e:
-        raise RuntimeError(f"SAM2ObjectTracker construction failed: {e}")
-
-# ========= App State =========
+# ===== App state =====
 state = {
     "ckpt": None,
     "tracker": None,
     "yolo": None,
     "tracking": False,
     "frame_idx": 0,
-
-    # proposals
-    "cands": [],
-    "selected_idx": 0,
-    "last_frame": None,
-
-    # saving (video tab)
-    "save_name": "segmented_output",
-    "writer": None,
-    "save_path": None,
-    "save_fps": 30.0,
+    "cands": [], "selected_idx": 0, "last_frame": None,
+    "save_name": "segmented_output", "writer": None, "save_path": None, "save_fps": 30.0,
 }
 
 def _ensure_yolo():
     if YOLO is None and state["yolo"] is None:
         raise RuntimeError("Ultralytics not installed. `pip install ultralytics`.")
     if state["yolo"] is None:
-        m = YOLO(DEFAULT_YOLO_MODEL)
-        m.model_name = DEFAULT_YOLO_MODEL
+        m = YOLO(DEFAULT_YOLO_MODEL); m.model_name = DEFAULT_YOLO_MODEL
         state["yolo"] = m
 
 def _reset_session():
     if state["writer"] is not None:
-        try:
-            state["writer"].release()
-        except Exception:
-            pass
+        try: state["writer"].release()
+        except Exception: pass
     state.update({
-        "tracker": None,
-        "yolo": None,
-        "tracking": False,
-        "frame_idx": 0,
-        "cands": [],
-        "selected_idx": 0,
-        "last_frame": None,
-        "writer": None,
-        "save_path": None,
+        "tracker": None, "yolo": None, "tracking": False, "frame_idx": 0,
+        "cands": [], "selected_idx": 0, "last_frame": None,
+        "writer": None, "save_path": None,
     })
 
-# ========= LIVE: per-frame handler (manual prompts only) =========
+# ===== Live handler (manual prompts) =====
 @torch.inference_mode()
 def process_live_frame(rgb_frame, ckpt):
     state["ckpt"] = ckpt
     if rgb_frame is None or ckpt is None:
         return None
-
     state["last_frame"] = rgb_frame
-
-    # lazy init tracker and yolo
     if state["tracker"] is None:
         state["tracker"] = _build_tracker_with_model(state["ckpt"])
-        state["tracking"] = False
-        state["frame_idx"] = 0
-
+        state["tracking"] = False; state["frame_idx"] = 0
     try:
         _ensure_yolo()
         cands = state["cands"] = run_yolo_boxes_rgb(state["yolo"], rgb_frame, conf=DEFAULT_YOLO_CONF)
     except Exception as e:
-        print("[YOLO warning]", e)
-        cands = state["cands"] = []
-
+        print("[YOLO warning]", e); cands = state["cands"] = []
     if state["tracking"]:
         pred = state["tracker"].track_all_objects(rgb_frame)
         vis = overlay_masks_rgb(rgb_frame, pred.get("pred_masks_high_res"))
-
-        # draw current proposals subtly so user can press Accept mid-stream
         if len(cands) > 0:
             bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR).copy()
             state["selected_idx"] = max(0, min(state["selected_idx"], len(cands)-1))
@@ -332,11 +285,9 @@ def process_live_frame(rgb_frame, ckpt):
                 color = (0,200,255) if j != state["selected_idx"] else (0,255,0)
                 cv2.rectangle(bgr, (int(x1),int(y1)), (int(x2),int(y2)), color, 2)
             vis = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
         state["frame_idx"] += 1
         return vis
-
-    # Not tracking yet → show proposals on raw frame
+    # not tracking yet → draw proposals
     draw = rgb_frame
     if len(cands) > 0:
         bgr = cv2.cvtColor(draw, cv2.COLOR_RGB2BGR).copy()
@@ -346,7 +297,6 @@ def process_live_frame(rgb_frame, ckpt):
             thick = 3 if j == state["selected_idx"] else 1
             cv2.rectangle(bgr, (int(x1),int(y1)), (int(x2),int(y2)), color, thick)
         draw = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
     return draw
 
 def ui_next():
@@ -363,163 +313,120 @@ def ui_accept():
     if state["last_frame"] is None or not state["cands"]:
         return "No candidate available."
     if state["tracker"] is None:
-        return "Tracker not initialized yet."
+        return "Tracker not initialized."
     idx = max(0, min(state["selected_idx"], len(state["cands"])-1))
     (x1,y1),(x2,y2) = state["cands"][idx]
     bbox = np.array([[[x1, y1], [x2, y2]]], dtype=np.float32)
     state["tracker"].track_new_object(state["last_frame"], box=bbox)
-    return f"Added object (curr_obj_idx={getattr(state['tracker'], 'curr_obj_idx', '?')}). You can add more whenever you want."
+    return f"Added object (curr_obj_idx={state['tracker'].curr_obj_idx})."
 
 def ui_start_tracking():
     if state["tracker"] is None or state["last_frame"] is None:
         return "Tracker not ready."
     if getattr(state["tracker"], "curr_obj_idx", 0) == 0:
         return "Add at least one object first (press Accept)."
-    state["tracking"] = True
-    state["frame_idx"] = 0
-    return f"Tracking started with {getattr(state['tracker'], 'curr_obj_idx', '?')} object(s)."
+    state["tracking"] = True; state["frame_idx"] = 0
+    return f"Tracking started with {state['tracker'].curr_obj_idx} object(s)."
 
 def ui_reset():
     _reset_session()
     return "Reset done."
 
-# ========= VIDEO mode (generator) =========
+# ===== Video mode =====
 def start_video(video_file, ckpt, save_name):
     _reset_session()
     state["ckpt"] = ckpt
     state["save_name"] = (save_name or "").strip() or "segmented_output"
-
     if video_file is None:
-        yield None, None, "Provide a video file."
-        return
-
+        yield None, None, "Provide a video file."; return
     path = video_file if isinstance(video_file, str) else getattr(video_file, "name", None)
     if not path or not os.path.exists(path):
-        yield None, None, "Invalid video."
-        return
-
+        yield None, None, "Invalid video."; return
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        yield None, None, "Cannot open video."
-        return
-
+        yield None, None, "Cannot open video."; return
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     state["save_fps"] = float(fps)
-
     try:
         state["tracker"] = _build_tracker_with_model(state["ckpt"])
     except Exception as e:
-        yield None, None, f"Tracker init failed: {e}"
-        cap.release()
-        return
-
+        yield None, None, f"Tracker init failed: {e}"; cap.release(); return
     try:
         _ensure_yolo()
     except Exception as e:
-        print("[YOLO warning]", e)
-        state["yolo"] = None
-
+        print("[YOLO warning]", e); state["yolo"] = None
     ok, bgr = cap.read()
     if not ok:
-        cap.release()
-        yield None, None, "Empty video."
-        return
+        cap.release(); yield None, None, "Empty video."; return
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     state["last_frame"] = rgb
-
     w, h = rgb.shape[1], rgb.shape[0]
     writer, path_out = _try_open_writer(os.path.join("/tmp", state["save_name"]), (w, h), fps)
     state["writer"], state["save_path"] = writer, path_out
-
     draw = process_live_frame(rgb, ckpt)
     yield draw, None, "Paused on first frame. Press **Accept** to add objects, then **Start Tracking (video)**."
-
     while not state["tracking"]:
         time.sleep(0.05)
         yield process_live_frame(state["last_frame"], ckpt), None, "Waiting…"
-
     delay = 1.0 / float(fps)
     while True:
         ok, bgr = cap.read()
-        if not ok:
-            break
+        if not ok: break
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         out = process_live_frame(rgb, ckpt)
         if state["writer"] is not None and out is not None:
-            bgrw = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-            state["writer"].write(bgrw)
+            state["writer"].write(cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
         yield out, None, f"Tracking… frame {state['frame_idx']}"
         time.sleep(max(0.0, delay * 0.8))
-
     cap.release()
     if state["writer"] is not None:
-        try:
-            state["writer"].release()
-        except Exception:
-            pass
+        try: state["writer"].release()
+        except Exception: pass
     yield None, state.get("save_path", None), "Done."
 
-# ========= UI =========
+# ===== UI =====
 CKPTS = list_checkpoints()
-
-with gr.Blocks(title="SAM2 Realtime + KF — Live & Video (YOLO-assisted, user prompts only)") as demo:
-    gr.Markdown("### SAM2 Realtime + Kalman Filter — add YOLO boxes whenever you want (before **or** during tracking)")
-
+with gr.Blocks(title="SAM2 Realtime + KF — Live & Video (user prompts only)") as demo:
+    gr.Markdown("### Add boxes whenever you want (before **or** during tracking)")
     with gr.Tabs():
-        # LIVE TAB
-        with gr.Tab("Live (webcam frames)"):
+        with gr.Tab("Live (webcam)"):
             ckpt = gr.Dropdown(choices=CKPTS, value=CKPTS[0] if CKPTS else None, label="Checkpoint (.pt/.pth)")
             cam = gr.Image(sources=["webcam"], streaming=True, label="Webcam", type="numpy")
             out_live = gr.Image(label="Output (live)")
-
             with gr.Row():
-                btn_prev   = gr.Button("Prev proposal")
+                btn_prev   = gr.Button("Prev")
                 btn_accept = gr.Button("Accept (add object)")
-                btn_next   = gr.Button("Next proposal")
+                btn_next   = gr.Button("Next")
                 btn_start  = gr.Button("Start Tracking")
                 btn_reset  = gr.Button("Reset")
-
-            live_status = gr.Markdown("Status: waiting…")
-
+            status = gr.Markdown("Status: waiting…")
             cam.stream(fn=process_live_frame, inputs=[cam, ckpt], outputs=out_live)
             btn_next.click(fn=ui_next, inputs=None, outputs=None)
             btn_prev.click(fn=ui_prev, inputs=None, outputs=None)
-            btn_accept.click(fn=ui_accept, inputs=None, outputs=live_status)
-            btn_start.click(fn=ui_start_tracking, inputs=None, outputs=live_status)
-            btn_reset.click(fn=ui_reset, inputs=None, outputs=live_status)
-
-        # VIDEO TAB
+            btn_accept.click(fn=ui_accept, inputs=None, outputs=status)
+            btn_start.click(fn=ui_start_tracking, inputs=None, outputs=status)
+            btn_reset.click(fn=ui_reset, inputs=None, outputs=status)
         with gr.Tab("Video file"):
             ckpt_v = gr.Dropdown(choices=CKPTS, value=CKPTS[0] if CKPTS else None, label="Checkpoint (.pt/.pth)")
             vid = gr.File(label="Video file", file_types=["video"])
             save_name = gr.Textbox(value="segmented_output", label="Output base filename (/tmp)")
-
             out_vid = gr.Image(label="Output (video)")
-            download = gr.File(label="Download segmented video (appears when finished)")
+            download = gr.File(label="Download (appears when finished)")
             status_v = gr.Markdown("")
-
             btn_start_vid = gr.Button("Start Tracking (video)")
-            btn_start_vid.click(
-                fn=start_video,
-                inputs=[vid, ckpt_v, save_name],
-                outputs=[out_vid, download, status_v]
-            )
+            btn_start_vid.click(fn=start_video, inputs=[vid, ckpt_v, save_name], outputs=[out_vid, download, status_v])
 
     gr.Markdown("""
-**How to use**
-- **Live:** pick a checkpoint → YOLO proposals appear → press **Accept** to add an object whenever you want → **Start Tracking**.  
-  You can keep pressing **Accept** mid-stream to add more (capacity ~10 by default).
-- **Video:** upload clip → first frame pauses → **Accept** a few → **Start Tracking (video)** → a download link appears when done.
+**Quick use**
+1) Pick a checkpoint.  
+2) Webcam: proposals appear → click **Accept** to add one/more → **Start Tracking**.  
+3) Video: upload → first frame pauses → **Accept** some → **Start Tracking (video)** → download appears when done.
 """)
 
 if __name__ == "__main__":
     app, local_url, share_url = demo.queue().launch(
-        share=True,
-        debug=True,
-        show_error=True,
-        server_name="0.0.0.0",
-        server_port=7860,
-        prevent_thread_lock=True,
+        share=True, debug=True, show_error=True,
+        server_name="0.0.0.0", server_port=7860, prevent_thread_lock=True
     )
     print("Local URL:", local_url)
     print("Share URL:", share_url)
