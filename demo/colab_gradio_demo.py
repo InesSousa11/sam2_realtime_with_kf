@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import gradio as gr
 from typing import Optional
+from omegaconf import OmegaConf
 
 # ===== Perf knobs (safe on CPU) =====
 if torch.cuda.is_available():
@@ -32,31 +33,28 @@ try:
 except Exception:
     YOLO = None  # optional
 
-# ===== New: Hydra/OmegaConf loader =====
-from omegaconf import OmegaConf
-
 # ===== Defaults =====
 DEFAULT_NUM_OBJECTS = 10
 DEFAULT_YOLO_MODEL = "yolov8n.pt"
 DEFAULT_YOLO_CONF = 0.25
 
+# Map ckpt name → candidate config paths in THIS repo (July SAM2)
 CFG_CANDIDATES = {
     "tiny": [
         "sam2/configs/sam2/sam2_hiera_t.yaml",
-        "configs/sam2.1_hiera_t.yaml", "configs/samurai/sam2.1_hiera_t.yaml",
+        "configs/sam2/sam2_hiera_t.yaml",
     ],
     "small": [
         "sam2/configs/sam2/sam2_hiera_s.yaml",
-        "configs/sam2.1_hiera_s.yaml", "configs/samurai/sam2.1_hiera_s.yaml",
+        "configs/sam2/sam2_hiera_s.yaml",
     ],
     "base_plus": [
         "sam2/configs/sam2/sam2_hiera_b+.yaml",
-        "configs/sam2.1_hiera_b+.yaml", "configs/sam2.1_hiera_base_plus.yaml",
-        "configs/samurai/sam2.1_hiera_b+.yaml",
+        "configs/sam2/sam2_hiera_b+.yaml",
     ],
     "large": [
         "sam2/configs/sam2/sam2_hiera_l.yaml",
-        "configs/sam2.1_hiera_l.yaml", "configs/samurai/sam2.1_hiera_l.yaml",
+        "configs/sam2/sam2_hiera_l.yaml",
     ],
 }
 
@@ -72,11 +70,14 @@ def _guess_cfg_for_ckpt(ckpt_path: str) -> tuple[str, str]:
     elif "large" in name or name.endswith("_l.pt"):
         group = "large"
     else:
+        # If user selected 2.1 file like sam2.1_hiera_small.pt, default to July "small"
         group = "small"
+
     for cand in CFG_CANDIDATES[group]:
         if os.path.exists(cand):
             return cand, os.path.basename(cand)
-    # fallback to first candidate (basename may resolve inside builder)
+
+    # fallback to first candidate (builder may resolve relative)
     cand = CFG_CANDIDATES[group][0]
     return cand, os.path.basename(cand)
 
@@ -89,7 +90,11 @@ def list_checkpoints(ckpt_dir="checkpoints"):
         for f in fnames:
             if f.endswith((".pt", ".pth")):
                 files.append(os.path.join(root, f))
-    return sorted(files)
+    # Put July weights first so the dropdown defaults to them
+    def sort_key(p):
+        b = os.path.basename(p)
+        return (b.startswith("sam2.1_"), b)  # July first (False < True)
+    return sorted(files, key=sort_key)
 
 def overlay_masks_rgb(frame_rgb, masks_tensor, alpha=0.45):
     if masks_tensor is None:
@@ -147,48 +152,52 @@ def _try_open_writer(base_path, size, fps):
 
 # ===== Discover & build SAM2 model safely =====
 def _load_cfg_object(cfg_path_or_basename: str):
-    """Try OmegaConf.load on path; if that fails, try to locate under ./ or ./sam2/configs/sam2/."""
+    """Try OmegaConf.load on path; otherwise None (some builders want the string path)."""
     try:
         if os.path.exists(cfg_path_or_basename):
             return OmegaConf.load(cfg_path_or_basename)
     except Exception:
         pass
-    # try common roots
-    for root in ["", "sam2/configs/sam2", "configs", "configs/samurai", "sam2/configs"]:
-        p = os.path.join(root, cfg_path_or_basename)
-        if os.path.exists(p):
-            try:
-                return OmegaConf.load(p)
-            except Exception:
-                continue
-    return None  # builder may still handle just the basename
+    return None
 
 def _discover_and_build_sam2(cfg_path_to_load: str, cfg_basename_for_builder: str, ckpt_path: str):
+    """
+    Try many function signatures. IMPORTANT: also try passing the **full path string**,
+    which is what this repo's July builder expects.
+    """
     try:
         mod = __import__("sam2.build_sam", fromlist=["*"])
     except Exception as e:
         raise ImportError(f"Couldn't import sam2.build_sam: {e}")
 
     cfg_obj = _load_cfg_object(cfg_path_to_load)  # may be None
+    cfg_str = cfg_path_to_load  # full path string
+
     trials = []  # (callable, description)
-    # Most likely signatures across forks:
     for name, fn in inspect.getmembers(mod, inspect.isfunction):
-        lower = name.lower()
-        if "build" not in lower:
+        if "build" not in name.lower():
             continue
-        # pass cfg object first
+        # Try with full path string first (this fixes your error)
         trials += [
-            (lambda f=fn: f(cfg_obj, ckpt_path), f"{name}(cfg_obj, ckpt)"),
-            (lambda f=fn: f(config=cfg_obj, checkpoint=ckpt_path), f"{name}(config=cfg_obj, checkpoint=...)"),
-            # pass basename (Hydra-style resolver)
+            (lambda f=fn: f(cfg_str, ckpt_path), f"{name}('fullpath', ckpt)"),
+            (lambda f=fn: f(config=cfg_str, checkpoint=ckpt_path), f"{name}(config='fullpath', checkpoint=...)"),
+            # Then basename (some forks resolve internally)
             (lambda f=fn: f(cfg_basename_for_builder, ckpt_path), f"{name}('basename', ckpt)"),
             (lambda f=fn: f(config=cfg_basename_for_builder, checkpoint=ckpt_path), f"{name}(config='basename', checkpoint=...)"),
-            # some builders accept only cfg and then you load state later; try it anyway
-            (lambda f=fn: f(cfg_obj), f"{name}(cfg_obj)"),
+            # Then pass cfg object (if supported)
+            (lambda f=fn: f(cfg_obj, ckpt_path), f"{name}(cfg_obj, ckpt)"),
+            (lambda f=fn: f(config=cfg_obj, checkpoint=ckpt_path), f"{name}(config=cfg_obj, checkpoint=...)"),
+            # Some builders return an uninitialized model with only cfg
+            (lambda f=fn: f(cfg_str), f"{name}('fullpath')"),
             (lambda f=fn: f(cfg_basename_for_builder), f"{name}('basename')"),
+            (lambda f=fn: f(cfg_obj), f"{name}(cfg_obj)"),
         ]
 
     last_err = None
+    def _has_parts(m):
+        needed = ["image_encoder", "memory_attention", "memory_encoder", "prompt_encoder", "mask_decoder"]
+        return (m is not None) and all(hasattr(m, k) for k in needed)
+
     for caller, desc in trials:
         try:
             built = caller()
@@ -198,15 +207,10 @@ def _discover_and_build_sam2(cfg_path_to_load: str, cfg_basename_for_builder: st
             last_err = e
             continue
 
-        # unwrap common holders
         candidates = [built]
-        for attr in ["model", "sam", "sam2", "module", "net"]:
+        for attr in ["model", "sam", "sam2", "module", "net", "backbone"]:
             if hasattr(built, attr):
                 candidates.append(getattr(built, attr))
-
-        def _has_parts(m):
-            needed = ["image_encoder", "memory_attention", "memory_encoder", "prompt_encoder", "mask_decoder"]
-            return m is not None and all(hasattr(m, k) for k in needed)
 
         for m in candidates:
             if _has_parts(m):
@@ -418,7 +422,7 @@ with gr.Blocks(title="SAM2 Realtime + KF — Live & Video (user prompts only)") 
 
     gr.Markdown("""
 **Quick use**
-1) Pick a checkpoint.  
+1) Pick a checkpoint (prefer the **July** ones: `sam2_hiera_*.pt`).  
 2) Webcam: proposals appear → click **Accept** to add one/more → **Start Tracking**.  
 3) Video: upload → first frame pauses → **Accept** some → **Start Tracking (video)** → download appears when done.
 """)
