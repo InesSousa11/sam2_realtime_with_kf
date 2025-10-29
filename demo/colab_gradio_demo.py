@@ -1,5 +1,3 @@
-# demo/colab_gradio_demo.py
-
 import os
 import cv2
 import time
@@ -7,7 +5,6 @@ import numpy as np
 import torch
 import gradio as gr
 import traceback
-
 from ultralytics import YOLO
 
 # -------- Performance knobs --------
@@ -16,121 +13,32 @@ if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# ========= BUILD TRACKER (repo-correct) =========
-# We use your SAM2ObjectTracker class and build a SAM2 model under the hood.
-# Config names here match THIS repo (July SAM2 configs, Sept 2.1 checkpoints).
-from importlib import import_module
-import inspect
+# -------- Build predictor (fixed paths for THIS repo) --------
+from sam2.build_sam import build_sam2_camera_predictor
 
-# Fixed paths (no UI)
-CKPT = "checkpoints/sam2.1_hiera_small.pt"
-CFG_BASENAME = "sam2_hiera_s.yaml"
-CFG_CANDIDATES = [
-    f"sam2/configs/sam2/{CFG_BASENAME}",
-    f"configs/sam2/{CFG_BASENAME}",
-]
+REPO = "/content/sam2_realtime_with_kf"
 
-# Pull tracker class
-_tracker_mod = None
-_last_err = None
-for mod in ["sam2.sam2_object_tracker", "sam2.tools.sam2_object_tracker"]:
-    try:
-        _tracker_mod = import_module(mod)
-        break
-    except Exception as e:
-        _last_err = e
-if _tracker_mod is None:
-    raise ImportError(f"Couldn't import SAM2ObjectTracker (last error: {_last_err})")
-SAM2ObjectTracker = getattr(_tracker_mod, "SAM2ObjectTracker")
+# July SAM 2 names that exist in this repo:
+CKPT_SMALL = os.path.join(REPO, "checkpoints/sam2.1_hiera_small.pt")
+CFG_SMALL  = "sam2/configs/sam2/sam2_hiera_s.yaml"
 
-def _first_exist(paths):
-    for p in paths:
-        if os.path.exists(p):
-            return p
-    return None
+# (Optional fallbacks if small is missing)
+CKPT_TINY = os.path.join(REPO, "checkpoints/sam2.1_hiera_tiny.pt")
+CFG_TINY  = "sam2/configs/sam2/sam2_hiera_t.yaml"
 
-try:
-    from omegaconf import OmegaConf
-except Exception:
-    OmegaConf = None
+def _pick_cfg_ckpt():
+    if os.path.exists(CKPT_SMALL):
+        return CFG_SMALL, CKPT_SMALL
+    if os.path.exists(CKPT_TINY):
+        return CFG_TINY, CKPT_TINY
+    # last resort (will throw later if truly missing)
+    return CFG_SMALL, CKPT_SMALL
 
-def _load_cfg_for_builder():
-    cfg_path = _first_exist(CFG_CANDIDATES)
-    if cfg_path and OmegaConf is not None:
-        try:
-            return OmegaConf.load(cfg_path), os.path.basename(cfg_path), cfg_path
-        except Exception:
-            pass
-    # Fall back to just basename; many forks resolve internally.
-    return None, CFG_BASENAME, _first_exist(CFG_CANDIDATES) or CFG_BASENAME
+CFG, CKPT = _pick_cfg_ckpt()
+print(f"[sam2] Using CFG={CFG}  CKPT={CKPT}")
+predictor = build_sam2_camera_predictor(CFG, CKPT)
 
-def _discover_and_build_sam2():
-    """
-    Import sam2.build_sam and try common builder signatures so this works
-    across forks (build_sam2, build_model, build_*predictor, etc.).
-    Returns a model exposing the encoders/decoders SAM2ObjectTracker expects.
-    """
-    try:
-        mod = import_module("sam2.build_sam")
-    except Exception as e:
-        raise ImportError(f"Couldn't import sam2.build_sam: {e}")
-
-    cfg_obj, cfg_base, cfg_path_print = _load_cfg_for_builder()
-    print(f"[sam2] cfg → {os.path.abspath(cfg_path_print) if os.path.exists(str(cfg_path_print)) else cfg_base}")
-
-    trials = []
-    for name, fn in inspect.getmembers(mod, inspect.isfunction):
-        if "build" not in name.lower():
-            continue
-        trials += [
-            (lambda f=fn: f(cfg_obj, CKPT), f"{name}(cfg_obj, ckpt)"),
-            (lambda f=fn: f(config=cfg_obj, checkpoint=CKPT), f"{name}(config=cfg_obj, checkpoint=...)"),
-            (lambda f=fn: f(cfg_base, CKPT), f"{name}('{cfg_base}', ckpt)"),
-            (lambda f=fn: f(config=cfg_base, checkpoint=CKPT), f"{name}(config='{cfg_base}', checkpoint=...)"),
-            (lambda f=fn: f(cfg_obj), f"{name}(cfg_obj)"),
-            (lambda f=fn: f(cfg_base), f"{name}('{cfg_base}')"),
-        ]
-
-    need = ["image_encoder", "memory_attention", "memory_encoder", "prompt_encoder", "mask_decoder"]
-    last_err = None
-    for caller, desc in trials:
-        try:
-            built = caller()
-        except TypeError:
-            continue
-        except Exception as e:
-            last_err = e
-            continue
-
-        cands = [built]
-        for attr in ["model", "sam", "sam2", "module", "net", "backbone"]:
-            if hasattr(built, attr):
-                cands.append(getattr(built, attr))
-        for m in cands:
-            if m is not None and all(hasattr(m, k) for k in need):
-                print(f"[sam2] using builder → {desc}")
-                return m
-
-    raise RuntimeError(f"Could not build a SAM2 model exposing encoders (last error: {last_err})")
-
-def build_tracker():
-    if not os.path.exists(CKPT):
-        raise RuntimeError(f"Checkpoint not found: {CKPT}")
-    model = _discover_and_build_sam2()
-    return SAM2ObjectTracker(
-        image_encoder=model.image_encoder,
-        memory_attention=model.memory_attention,
-        memory_encoder=model.memory_encoder,
-        prompt_encoder=model.prompt_encoder,
-        mask_decoder=model.mask_decoder,
-        num_objects=10,
-        device=("cuda" if torch.cuda.is_available() else "cpu"),
-    )
-
-# Create the tracker once at import-time (same as your predictor pattern)
-tracker = build_tracker()
-
-# --- robust SAMURAI/KF toggler (works if attrs exist; safe if not) ---
+# --- robust SAMURAI-mode toggler (works across forks) ---
 def _maybe_set_attr(obj, name, value):
     try:
         if hasattr(obj, name):
@@ -140,17 +48,18 @@ def _maybe_set_attr(obj, name, value):
         pass
     return False
 
-def set_samurai_mode(tracker_obj, enable: bool):
+def set_samurai_mode(predictor, enable: bool):
     """
-    Try sensible locations for KF-like flags. If your build doesn't expose them,
-    this is a no-op (keeps API parity with your reference demo).
+    Try all sensible locations for `samurai_mode`. When disabling,
+    also neutralize KF gating knobs if present.
     """
     hit = []
     candidates = [
-        tracker_obj,
-        getattr(tracker_obj, "model", None),
-        getattr(tracker_obj, "module", None),
-        getattr(getattr(tracker_obj, "module", None), "model", None),
+        predictor,
+        getattr(predictor, "model", None),
+        getattr(getattr(predictor, "model", None), "model", None),
+        getattr(predictor, "module", None),
+        getattr(getattr(predictor, "module", None), "model", None),
     ]
     candidates = [c for c in candidates if c is not None]
 
@@ -159,6 +68,7 @@ def set_samurai_mode(tracker_obj, enable: bool):
             hit.append(f"{c.__class__.__name__}.samurai_mode")
 
     if not enable:
+        # Make the KF path a no-op if the flag is ignored in this build
         for c in candidates:
             if _maybe_set_attr(c, "stable_frames_threshold", 0):
                 hit.append(f"{c.__class__.__name__}.stable_frames_threshold=0")
@@ -170,21 +80,21 @@ def set_samurai_mode(tracker_obj, enable: bool):
             _maybe_set_attr(c, "stable_frames", 0)
             _maybe_set_attr(c, "frame_cnt", 0)
 
-    if hit:
-        print(("SAMURAI mode: ON" if enable else "SAMURAI mode: OFF") + " | " + ", ".join(hit))
-    else:
+    if not hit:
         print("Warning: couldn't set any samurai_mode/KF attrs (ok if your build hides them).")
+    else:
+        print(("SAMURAI mode: ON" if enable else "SAMURAI mode: OFF") + " | " + ", ".join(hit))
     return enable
 
 # Default: assume single-person until user adds more
-set_samurai_mode(tracker, True)
+set_samurai_mode(predictor, True)
 
 # YOLO for proposals
 yolo_model = YOLO("yolov8s.pt")
 
 # ---------- small utils ----------
 def _writable_dir():
-    return "/tmp"
+    return "/tmp"  # Gradio-compatible
 
 def _resolve_video_path(video_input):
     if isinstance(video_input, str):
@@ -221,37 +131,41 @@ def yolo_person_bboxes(rgb_frame, model, conf_thres=0.25):
     out.sort(key=lambda t: t[4], reverse=True)
     return out
 
-def _count_objs(pred_masks_or_ids):
-    if pred_masks_or_ids is None:
+def _count_objs(out_obj_ids):
+    if out_obj_ids is None:
         return 0
-    # our tracker returns masks list/np/tensor; count along first dim
-    if isinstance(pred_masks_or_ids, (list, tuple)):
-        return len(pred_masks_or_ids)
-    if torch.is_tensor(pred_masks_or_ids):
-        return int(pred_masks_or_ids.shape[0]) if pred_masks_or_ids.ndim >= 1 else int(pred_masks_or_ids.numel())
-    if hasattr(pred_masks_or_ids, "shape"):
-        return int(pred_masks_or_ids.shape[0])
+    if isinstance(out_obj_ids, (list, tuple)):
+        return len(out_obj_ids)
+    if torch.is_tensor(out_obj_ids):
+        return int(out_obj_ids.shape[0]) if out_obj_ids.ndim >= 1 else int(out_obj_ids.numel())
     return 0
 
-def draw_mask_overlay(rgb_frame, pred_masks_high_res):
+def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     if rgb_frame is None:
         return None
-    n = _count_objs(pred_masks_high_res)
+    n = _count_objs(out_obj_ids)
     if n == 0:
         return rgb_frame
     h, w = rgb_frame.shape[:2]
     all_mask = np.zeros((h, w, 3), dtype=np.uint8)
     all_mask[..., 1] = 255  # saturation
     for i in range(n):
-        logits_i = pred_masks_high_res[i]
-        if torch.is_tensor(logits_i):
-            m = (logits_i > 0).detach().cpu().numpy().astype(np.uint8)
+        if isinstance(out_mask_logits, (list, tuple)):
+            logits_i = out_mask_logits[i]
+        elif torch.is_tensor(out_mask_logits):
+            logits_i = out_mask_logits[i]
         else:
-            m = (np.asarray(logits_i) > 0).astype(np.uint8)
-        if m.ndim == 3:
-            m = m.squeeze()
+            continue
+        # ensure (H,W,1)
+        if logits_i.ndim == 3:
+            m = (logits_i > 0).permute(1, 2, 0)
+        elif logits_i.ndim == 2:
+            m = (logits_i > 0).unsqueeze(-1)
+        else:
+            continue
+        m = m.detach().cpu().numpy().astype(np.uint8) * 255
         hue = int((i + 3) / (n + 3) * 255)
-        sel = m.astype(bool)
+        sel = m[..., 0] == 255
         all_mask[sel, 0] = hue
         all_mask[sel, 2] = 255
     all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
@@ -260,7 +174,7 @@ def draw_mask_overlay(rgb_frame, pred_masks_high_res):
 # -------- App state --------
 state = {
     # session & seeding
-    "first_frame_loaded": False,   # (kept for parity; tracker doesn’t need it)
+    "first_frame_loaded": False,
     "seeded_any": False,
     "tracking": False,
 
@@ -270,8 +184,16 @@ state = {
     "cands": [],
     "last_frame": None,
 
-    # bookkeeping
-    "added_count": 0,  # how many objects we added (used to toggle samurai_mode)
+    # multi-object bookkeeping
+    "next_obj_id": 1,
+    "added_obj_ids": [],   # list of ints
+
+    # last output
+    "out_obj_ids": None,
+    "out_mask_logits": None,
+
+    # frame counter (needed for mid-stream prompts)
+    "frame_idx": 0,
 
     # video & auto-save
     "video_path": None,
@@ -327,31 +249,43 @@ def _finalize_writer():
 def process_frame(rgb_frame):
     """
     Webcam:
-      - While tracking=False you can Accept several people (all on the current frame).
-      - You CAN also Accept mid-stream (adds new object immediately).
+      - While tracking=False you can Accept several people (all on frame 0).
+      - You can ALSO accept **mid-stream**: we pass the current frame_idx to add_new_prompt.
     Video:
       - Pauses on the first frame to accept several; Start Tracking begins playback.
+      - You can accept during playback as well (mid-stream prompts).
     """
     if rgb_frame is None:
         return None
     state["last_frame"] = rgb_frame
 
+    # Bind first frame lazily: load_first_frame once
+    if not state["first_frame_loaded"]:
+        try:
+            predictor.load_first_frame(rgb_frame)
+            state["first_frame_loaded"] = True
+            state["frame_idx"] = 0
+        except Exception as e:
+            # Some forks auto-handle this on first add_new_prompt/track
+            print("[warn] load_first_frame skipped:", repr(e))
+
     # 1) If tracking, run tracker and draw masks onto base
     base = rgb_frame
     if state["tracking"]:
         try:
-            # repo tracker API
-            pred = tracker.track_all_objects(rgb_frame)
-            masks = pred.get("pred_masks_high_res")
-            base = draw_mask_overlay(rgb_frame, masks)
+            out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
+            state["out_obj_ids"] = out_obj_ids
+            state["out_mask_logits"] = out_mask_logits
+            base = draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits)
         except Exception as e:
-            print("[error] track_all_objects() failed:", repr(e))
+            print("[error] track() failed:", repr(e))
             print(traceback.format_exc())
             base = rgb_frame
         _maybe_open_writer_on_first_segmented(base)
         _write_segmented_frame(base)
+        state["frame_idx"] += 1  # advance only while tracking
 
-    # 2) (Optional) draw YOLO proposals on top
+    # 2) (Optional) draw YOLO proposals ON TOP of whatever base is (segmented or raw)
     if state["yolo_enabled"]:
         cands = yolo_person_bboxes(rgb_frame, yolo_model, conf_thres=0.25)
         state["cands"] = cands
@@ -391,49 +325,68 @@ def on_toggle_yolo():
 def on_accept():
     """
     Add the selected bbox as a new object.
-    Works both BEFORE and DURING tracking.
+    Works both **before** and **during** tracking (mid-stream prompts).
     """
     if not state["cands"] or state["last_frame"] is None:
         return "No candidate available."
 
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
-    # repo tracker expects shape [N,2,2] with absolute pixels
-    bbox = np.array([[[x1, y1], [x2, y2]]], dtype=np.float32)
+    bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
+
+    # Make sure first frame is bound (for forks that require it)
+    if not state["first_frame_loaded"]:
+        predictor.load_first_frame(state["last_frame"])
+        state["first_frame_loaded"] = True
+        state["frame_idx"] = 0
+
+    obj_id = state["next_obj_id"]
+
+    # If we are already tracking, add prompt at the **current** frame index
+    frame_idx_for_prompt = state["frame_idx"] if state["tracking"] else 0
 
     try:
-        tracker.track_new_object(state["last_frame"], box=bbox)
-    except Exception as e:
-        return f"Add failed: {e}"
+        _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
+            frame_idx=frame_idx_for_prompt, obj_id=obj_id, bbox=bbox
+        )
+    except TypeError:
+        # Some forks use (obj_id, bbox) without frame_idx
+        _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
+            obj_id=obj_id, bbox=bbox
+        )
 
     state["seeded_any"] = True
-    state["added_count"] += 1
+    state["next_obj_id"] += 1
+    state["added_obj_ids"].append(obj_id)
+    state["out_obj_ids"] = out_obj_ids
+    state["out_mask_logits"] = out_mask_logits
 
-    # If >1 objects, disable KF/SAMURAI-like behavior (if the build exposes it)
-    if state["added_count"] > 1:
-        set_samurai_mode(tracker, False)
+    # If we now have >1 objects, switch off KF/SAMURAI to avoid boolean/KF ambiguity
+    if len(state["added_obj_ids"]) > 1:
+        set_samurai_mode(predictor, False)
 
-    return f"Added object #{state['added_count']} (conf={conf:.2f}). " \
-           f"You can keep adding{' (even mid-stream)' if state['tracking'] else ''} or press 'Start Tracking'."
+    where = "mid-stream" if state["tracking"] else "frame 0"
+    return f"Added object #{obj_id} at {where} (conf={conf:.2f})."
 
 def on_start_tracking():
     """
     Begin per-frame tracking; decide SAMURAI mode based on how many objects were seeded.
     """
-    # repo tracker exposes curr_obj_idx
-    if getattr(tracker, "curr_obj_idx", 0) == 0:
+    if not state["seeded_any"]:
         return "No objects added yet. Accept at least one person first."
 
-    # Single object → enable SAMURAI(KF) if present; Multi → disable
-    set_samurai_mode(tracker, enable=(state["added_count"] == 1))
+    num_objs = len(state["added_obj_ids"])
+    # Single object → enable SAMURAI (KF); Multi → disable (use plain SAM2)
+    set_samurai_mode(predictor, enable=(num_objs == 1))
 
     state["tracking"] = True
-    return f"Tracking started. (objects={state['added_count']}, " \
-           f"samurai_mode={'ON' if state['added_count']==1 else 'OFF'})"
+    return f"Tracking started. (objects={num_objs}, samurai_mode={'ON' if num_objs==1 else 'OFF'})"
 
 def on_reset():
-    global tracker
-    tracker = build_tracker()              # rebuild fresh model+tracker
-    set_samurai_mode(tracker, True)        # default back to single-object assumption
+    global predictor
+    CFG, CKPT = _pick_cfg_ckpt()
+    predictor = build_sam2_camera_predictor(CFG, CKPT)
+    # Default back to single-object assumption after reset
+    set_samurai_mode(predictor, True)
 
     _finalize_writer()
     state.update({
@@ -444,7 +397,11 @@ def on_reset():
         "selected_idx": 0,
         "cands": [],
         "last_frame": None,
-        "added_count": 0,
+        "next_obj_id": 1,
+        "added_obj_ids": [],
+        "out_obj_ids": None,
+        "out_mask_logits": None,
+        "frame_idx": 0,
         "video_path": None,
         "video_fps": 30.0,
         "saving_enabled": False,
@@ -456,7 +413,7 @@ def on_reset():
     })
     return "Reset done."
 
-# -------- Video (pause to seed; then tracking + auto-save) --------
+# -------- Video (pause to seed; allows mid-stream prompts too) --------
 def start_video(video_input, save_basename):
     on_reset()  # fresh session
 
@@ -496,7 +453,7 @@ def start_video(video_input, save_basename):
         time.sleep(0.05)
         yield process_frame(state["last_frame"]), None
 
-    # Playback with tracking on (+ auto save)
+    # Playback with tracking on
     while True:
         ok, bgr = cap.read()
         if not ok:
@@ -513,7 +470,7 @@ def start_video(video_input, save_basename):
 
 # -------- UI --------
 with gr.Blocks() as demo:
-    gr.Markdown("## SAM2 realtime (this repo) — Add people before **or** during tracking (Webcam or Video)")
+    gr.Markdown("## SAM2 real-time — Seed people before **and** during tracking (Webcam or Video)")
 
     src = gr.Radio(["Webcam", "Video"], value="Webcam", label="Source")
     cam = gr.Image(sources=["webcam"], streaming=True, visible=True, label="Webcam", type="numpy")
@@ -557,10 +514,10 @@ with gr.Blocks() as demo:
 
     gr.Markdown("""
 **How to use:**
-- **Webcam:** YOLO ON, press **Accept** for each person (you can add many) — you can also keep adding **mid-stream**.
-  Then **Start Tracking**.
-- **Video:** Upload file → **Start video**. On the first frame Accept several, then **Start Tracking**.
-  When it finishes, a download appears.
+- **Webcam:** YOLO ON, press **Accept** for each person (you can add many). Then **Start Tracking**.
+  You can also press **Accept** mid-stream to add new people; we pass the current frame index to the tracker.
+- **Video:** Upload file → **Start video**. On the first frame Accept several, press **Start Tracking** to play.
+  You can keep adding during playback. A download appears when it finishes.
 """)
 
 demo.launch(share=True)
