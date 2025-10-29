@@ -246,13 +246,16 @@ def stop_tracking():
     return gr.update(value="Stopped."), None
 
 
-def process_frame(frame: np.ndarray):
+def process_frame(frame: np.ndarray, mirror: bool = True):
     """Main per-frame callback. Receives an RGB image from the webcam.
     Returns an RGB image to display.
     """
     if frame is None:
         return None
     # Gradio gives RGB; convert to BGR for cv2-style processing and SAM2 (usually expects BGR)
+    # Optional horizontal mirror to match webcam selfie view
+    if mirror:
+        frame = cv2.flip(frame, 1)
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
     # If user clicked Detect & Track, run YOLO once to initialize
@@ -339,17 +342,18 @@ def build_demo() -> gr.Blocks:
         )
 
         with gr.Row():
-            cam = gr.Image(sources=["webcam"], streaming=True, label="Webcam", mirror=True)
+            cam = gr.Image(sources=["webcam"], streaming=True, label="Webcam")
             out = gr.Image(label="Output", interactive=False)
 
         with gr.Row():
+            mirror_cb = gr.Checkbox(label="Mirror webcam", value=True)
             status = gr.Textbox(label="Status", value="Idle.", interactive=False)
         with gr.Row():
             btn_arm = gr.Button("🔎 Detect & Track Person")
             btn_stop = gr.Button("⏹️ Stop")
 
         # Wire events
-        cam.stream(process_frame, inputs=cam, outputs=out)
+        cam.stream(process_frame, inputs=[cam, mirror_cb], outputs=out)
         btn_arm.click(arm_detection, inputs=None, outputs=[status, out])
         btn_stop.click(stop_tracking, inputs=None, outputs=[status, out])
 
